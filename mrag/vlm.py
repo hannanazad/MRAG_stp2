@@ -12,6 +12,15 @@ The prompt mirrors MUTCD's own taxonomy: outputs are blocked by rule type
 an explicit whitelist constructed from retrieval results. This logic is
 backend-agnostic — only the final "send to model" step differs.
 
+Prompt assembly is dispatched on CFG.prompt_style_answer (stp2_v1):
+  - "zeroshot"  → original behaviour: instructions + evidence + question
+  - "oneshot"   → one worked MUTCD example before the question
+  - "fewshot"   → multiple worked examples before the question
+  - "cot"       → reorders the output spec so reasoning comes first and
+                  Direct Answer is synthesized last (zero-shot CoT)
+
+Switch at runtime with CFG.set_answer_style(...) — no kernel restart needed.
+
 To swap models or providers, edit CFG in mrag/config.py only:
     CFG.vlm_provider  = "api" | "local"
     CFG.vlm_model_api = "qwen3-vl-32b-instruct"   (used when provider == "api")
@@ -26,6 +35,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from mrag.config import CFG
+from mrag.prompt_examples import FEWSHOT_EXAMPLES, format_example
 
 log = logging.getLogger("mrag.vlm")
 
@@ -234,6 +244,13 @@ class VLM:
         return valid[:max_keep]
 
     def _filter_prompt(self, question: str, indexed_figures) -> str:
+        # Only zeroshot is implemented for P2 today. CFG.prompt_style_filter
+        # is read for future-proofing; non-zeroshot values just log and
+        # fall through to the zeroshot prompt.
+        style = getattr(CFG, "prompt_style_filter", "zeroshot")
+        if style != "zeroshot":
+            log.debug("Filter style %r requested but not implemented; using zeroshot.", style)
+
         lines = []
         for i, _ip, f in indexed_figures:
             cap = (f.get("caption") or f.get("title") or "")[:140]
@@ -325,8 +342,14 @@ class VLM:
         return self._parse_filter_response(out_text)
 
     # ────────────────────────────────────────────────────────────────────
+    # Prompt assembly (stp2_v1) — dispatches on CFG.prompt_style_answer.
+    # Each style shares the same evidence/visual/citations blocks, but
+    # differs in (a) whether worked examples appear before the question,
+    # and (b) the output format spec (CoT puts Direct Answer last).
+    # ────────────────────────────────────────────────────────────────────
 
     def _build_prompt_and_images(self, question, chunks, figures, pages):
+        # --- shared: gather visuals + assemble evidence-side blocks --------
         image_paths: List[str] = []
         used_visuals = []
 
@@ -341,6 +364,29 @@ class VLM:
                 image_paths.append(ip)
                 used_visuals.append(("Page", p))
 
+        evidence_text = self._format_evidence_text(chunks)
+        visual_lines = self._format_visual_lines(used_visuals)
+        allowed_cites = self._format_allowed_cites(chunks, used_visuals)
+
+        # --- dispatch on style ---------------------------------------------
+        style = getattr(CFG, "prompt_style_answer", "zeroshot")
+        if style == "zeroshot":
+            prompt = self._assemble_zeroshot(question, evidence_text, visual_lines, allowed_cites)
+        elif style == "oneshot":
+            prompt = self._assemble_oneshot(question, evidence_text, visual_lines, allowed_cites)
+        elif style == "fewshot":
+            prompt = self._assemble_fewshot(question, evidence_text, visual_lines, allowed_cites)
+        elif style == "cot":
+            prompt = self._assemble_cot(question, evidence_text, visual_lines, allowed_cites)
+        else:
+            log.warning("Unknown prompt_style_answer %r; falling back to zeroshot.", style)
+            prompt = self._assemble_zeroshot(question, evidence_text, visual_lines, allowed_cites)
+
+        return prompt, image_paths
+
+    # ----- evidence-side formatting (shared by all styles) ----------------
+
+    def _format_evidence_text(self, chunks) -> str:
         groups: Dict[str, List[Dict[str, Any]]] = {
             "Standard": [], "Guidance": [], "Option": [], "Support": [],
         }
@@ -361,7 +407,9 @@ class VLM:
                     f"{(c.get('text','') or '')[:CFG.max_chunk_chars_in_prompt]}"
                 )
             evidence_blocks.append("")
+        return "\n".join(evidence_blocks)
 
+    def _format_visual_lines(self, used_visuals) -> List[str]:
         visual_lines = []
         for i, (kind, v) in enumerate(used_visuals, 1):
             if kind == "Figure":
@@ -373,7 +421,9 @@ class VLM:
                 visual_lines.append(
                     f"[Image {i}] Page {v.get('page_printed','?')} (full page view)"
                 )
+        return visual_lines
 
+    def _format_allowed_cites(self, chunks, used_visuals) -> List[str]:
         allowed_cites = []
         for c in chunks:
             allowed_cites.append(
@@ -384,8 +434,13 @@ class VLM:
                 allowed_cites.append(f"{v.get('figure_id','?')} (p.{v.get('page_printed','?')})")
             else:
                 allowed_cites.append(f"Page {v.get('page_printed','?')}")
+        return allowed_cites
 
-        prompt = (
+    # ----- prompt fragments (shared building blocks) ----------------------
+
+    @staticmethod
+    def _intro_block() -> str:
+        return (
             "You are an expert reader of the Manual on Uniform Traffic Control Devices "
             "(MUTCD, 11th Edition). Answer the user's question using ONLY the evidence below.\n\n"
             "MUTCD distinguishes four normative categories. Treat them carefully:\n"
@@ -393,6 +448,12 @@ class VLM:
             "  - Guidance: RECOMMENDED practice (modal verb: should).\n"
             "  - Option: PERMITTED practice (modal verb: may).\n"
             "  - Support: explanatory or informational only — never normative.\n\n"
+        )
+
+    @staticmethod
+    def _format_spec_standard() -> str:
+        # Direct-Answer-FIRST output format (zeroshot, oneshot, fewshot).
+        return (
             "Output format (use these exact section headings, omit any that have no content):\n"
             "  Direct Answer: 2–3 sentences in plain language.\n"
             "  Standards (mandatory): bullets quoting the relevant Standard provision(s).\n"
@@ -400,15 +461,111 @@ class VLM:
             "  Options (permitted): bullets.\n"
             "  Visual evidence: one sentence per relevant image, referenced as [Image N].\n"
             "  Citations: bullets, ONE PER LINE, chosen ONLY from the allowed list below.\n\n"
+        )
+
+    @staticmethod
+    def _format_spec_cot() -> str:
+        # Reasoning-FIRST, Direct-Answer-LAST output format (cot).
+        return (
+            "Output format (use these exact section headings, omit any that have no content):\n"
+            "  Reasoning: Work through the evidence step by step. For each piece of evidence, "
+            "identify (a) which MUTCD category it falls under — Standard / Guidance / Option / "
+            "Support — and (b) what it requires, recommends, permits, or merely explains. Then "
+            "identify which provisions are directly relevant to the user's question and how "
+            "they combine. Keep this section concise (4–8 sentences).\n"
+            "  Standards (mandatory): bullets quoting the relevant Standard provision(s).\n"
+            "  Guidance (recommended): bullets.\n"
+            "  Options (permitted): bullets.\n"
+            "  Visual evidence: one sentence per relevant image, referenced as [Image N].\n"
+            "  Direct Answer: 2–3 sentences in plain language that SYNTHESIZE the reasoning "
+            "above. Do NOT introduce new facts here.\n"
+            "  Citations: bullets, ONE PER LINE, chosen ONLY from the allowed list below.\n\n"
+        )
+
+    @staticmethod
+    def _rules_block() -> str:
+        return (
             "Rules:\n"
             "  - Never invent section numbers, figure numbers, or page numbers.\n"
             "  - If the evidence is insufficient, say so plainly and stop.\n"
             "  - Quote MUTCD wording verbatim when stating a Standard provision.\n\n"
+        )
+
+    @staticmethod
+    def _question_and_evidence_block(question, evidence_text, visual_lines, allowed_cites) -> str:
+        return (
             f"Question: {question}\n\n"
             f"Visual evidence ({len(visual_lines)} images attached):\n"
             + ("\n".join(visual_lines) if visual_lines else "(none)") + "\n\n"
-            f"Text evidence:\n" + "\n".join(evidence_blocks) + "\n"
+            f"Text evidence:\n{evidence_text}\n"
             f"Allowed citations (use ONLY these strings verbatim):\n"
             + "\n".join(f"  - {c}" for c in allowed_cites) + "\n"
         )
-        return prompt, image_paths
+
+    # ----- the four assemblers --------------------------------------------
+
+    def _assemble_zeroshot(self, question, evidence_text, visual_lines, allowed_cites) -> str:
+        return (
+            self._intro_block()
+            + self._format_spec_standard()
+            + self._rules_block()
+            + self._question_and_evidence_block(question, evidence_text, visual_lines, allowed_cites)
+        )
+
+    def _assemble_oneshot(self, question, evidence_text, visual_lines, allowed_cites) -> str:
+        if not FEWSHOT_EXAMPLES:
+            log.warning("oneshot requested but no FEWSHOT_EXAMPLES defined; using zeroshot.")
+            return self._assemble_zeroshot(question, evidence_text, visual_lines, allowed_cites)
+        example_block = (
+            "Here is one worked example of the expected reasoning and format. The example "
+            "uses real MUTCD content; treat it as an illustration of style, not as evidence "
+            "for any question below.\n\n"
+            + format_example(FEWSHOT_EXAMPLES[0], n=1, max_chars=CFG.max_chunk_chars_in_prompt)
+            + "\nNow answer the following question using ONLY its own evidence:\n\n"
+        )
+        return (
+            self._intro_block()
+            + self._format_spec_standard()
+            + self._rules_block()
+            + example_block
+            + self._question_and_evidence_block(question, evidence_text, visual_lines, allowed_cites)
+        )
+
+    def _assemble_fewshot(self, question, evidence_text, visual_lines, allowed_cites) -> str:
+        if not FEWSHOT_EXAMPLES:
+            log.warning("fewshot requested but no FEWSHOT_EXAMPLES defined; using zeroshot.")
+            return self._assemble_zeroshot(question, evidence_text, visual_lines, allowed_cites)
+        n = max(1, min(getattr(CFG, "fewshot_num_examples", 3), len(FEWSHOT_EXAMPLES)))
+        examples_text = "\n".join(
+            format_example(FEWSHOT_EXAMPLES[i], n=i+1, max_chars=CFG.max_chunk_chars_in_prompt)
+            for i in range(n)
+        )
+        example_block = (
+            f"Here are {n} worked examples of the expected reasoning and format. The examples "
+            "use real MUTCD content; treat them as illustrations of style, not as evidence "
+            "for any question below.\n\n"
+            + examples_text
+            + "\nNow answer the following question using ONLY its own evidence:\n\n"
+        )
+        return (
+            self._intro_block()
+            + self._format_spec_standard()
+            + self._rules_block()
+            + example_block
+            + self._question_and_evidence_block(question, evidence_text, visual_lines, allowed_cites)
+        )
+
+    def _assemble_cot(self, question, evidence_text, visual_lines, allowed_cites) -> str:
+        cot_instruction = (
+            "Approach: think carefully BEFORE writing the Direct Answer. In your Reasoning "
+            "section, do not skip the step of classifying each cited provision by MUTCD "
+            "category. The Direct Answer must follow from the Reasoning; do not introduce "
+            "new claims in the Direct Answer that are not justified above.\n\n"
+        )
+        return (
+            self._intro_block()
+            + self._format_spec_cot()
+            + self._rules_block()
+            + cot_instruction
+            + self._question_and_evidence_block(question, evidence_text, visual_lines, allowed_cites)
+        )

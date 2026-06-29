@@ -15,11 +15,15 @@ once, early, in your Colab setup cell, and every subprocess inherits it.
 """
 from __future__ import annotations
 
+import logging
 import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+
+log = logging.getLogger("mrag.config")
+
 
 def detect_environment() -> str:
     """Returns one of: 'colab', 'hprc', 'local'.
@@ -61,39 +65,19 @@ def _default_hf_home(env: str, base: Path) -> Path:
     return base / "hf_cache"
 
 
-# =============================================================================
-# Curated catalog of DashScope models you can swap to from the notebook.
+# ────────────────────────────────────────────────────────────────────────────
+# Prompt-style catalogs (stp2_v1).
 #
-# Switch by calling CFG.set_vlm_model("<alias>") or CFG.set_vlm_model("<raw id>").
-# `CFG.vlm_model_api` is read at call time by mrag.vlm._answer_api and
-# _filter_figures_api, so the next ask() picks up the change with no
-# init_pipeline() restart.
+# Two independent flags govern how prompts are assembled at inference time:
+#   - CFG.prompt_style_answer  → controls _build_prompt_and_images (P1)
+#   - CFG.prompt_style_filter  → controls _filter_prompt           (P2)
 #
-# IMPORTANT: glm-5.2 and kimi-k2.7-code are TEXT-ONLY on this DashScope
-# account (they aren't in the GET /models 'vl' list). If you switch to
-# them, the figure-filter call AND the answer call WILL fail with
-# 400 InvalidParameter the moment they receive images. Use them only
-# for a text-only baseline (you'd need to call them outside ask()).
-# Left in the catalog because they were requested for comparison.
-# =============================================================================
-VLM_API_MODELS: dict[str, str] = {
-    # ─── Qwen3-VL flagship (vision-language) ─────────────────────────────
-    "flagship":          "qwen3-vl-235b-a22b-instruct",
-    "flagship_thinking": "qwen3-vl-235b-a22b-thinking",
-    # ─── Qwen3-VL plus tier ──────────────────────────────────────────────
-    "plus_pinned":       "qwen3-vl-plus-2025-12-19",
-    "plus":              "qwen3-vl-plus",
-    # ─── Qwen-VL max (older top tier) ────────────────────────────────────
-    "max":               "qwen-vl-max",
-    # ─── Qwen3-VL flash (cheap + fast) ───────────────────────────────────
-    "flash_pinned":      "qwen3-vl-flash-2026-01-22",
-    "flash":             "qwen3-vl-flash",
-    # ─── Qwen-VL plus legacy (Qwen2.x era) ───────────────────────────────
-    "plus_legacy":       "qwen-vl-plus",
-    # ─── Non-VL comparison points (TEXT ONLY — see warning above) ────────
-    "glm":               "glm-5.2",
-    "kimi":              "kimi-k2.7-code",
-}
+# The answer prompt supports four styles; the filter prompt supports only
+# zeroshot for now (extending the filter is a separate piece of work — it
+# would require demonstration images, which substantially raises token cost).
+# ────────────────────────────────────────────────────────────────────────────
+ANSWER_STYLES_AVAILABLE: tuple = ("zeroshot", "oneshot", "fewshot", "cot")
+FILTER_STYLES_AVAILABLE: tuple = ("zeroshot",)
 
 
 @dataclass
@@ -127,14 +111,10 @@ class Config:
     # behaviour, unchanged).
     # "api" → call an OpenAI-compatible REST endpoint instead. No GPU,
     # no local download. Set vlm_model_api / api_base_url below.
-    vlm_provider: str = "api"  # "api" or "local" — default is api (Qwen3-VL via DashScope)
+    vlm_provider: str = "api"  # "api" or "local" — default is api (Qwen3-VL-32B via DashScope)
 
     # Model name string sent to the API endpoint when vlm_provider == "api".
-    # Default is qwen3-vl-plus-2025-12-19 — a Qwen3-VL "plus" tier dated
-    # snapshot known to be entitled on this account. Switch on demand from
-    # the notebook with CFG.set_vlm_model("<alias>") — see VLM_API_MODELS
-    # above for the curated catalog (flagship / flash / max / etc.).
-    vlm_model_api: str = "qwen3-vl-plus-2025-12-19"
+    vlm_model_api: str = "qwen3-vl-32b-instruct"
 
     # OpenAI-compatible API endpoint. INTERNATIONAL DashScope URL — use this
     # unless your Alibaba Cloud account is registered in mainland China.
@@ -202,6 +182,16 @@ class Config:
     max_new_tokens: int = 480
     max_chunk_chars_in_prompt: int = 1400
 
+    # ----- Prompt-style controls (stp2_v1) ----------------------------------
+    # See module-level docstring above the dataclass for the catalogs.
+    # Switch at runtime with CFG.set_answer_style(...) — no kernel restart
+    # needed; vlm.py reads these at call time.
+    prompt_style_answer: str = "zeroshot"   # P1 — answer generation prompt
+    prompt_style_filter: str = "zeroshot"   # P2 — figure relevance filter prompt
+    fewshot_num_examples: int = 3            # how many examples to use when
+                                             # prompt_style_answer == "fewshot".
+                                             # capped at len(FEWSHOT_EXAMPLES).
+
     # ----- ColPali ----------------------------------------------------------
     colqwen_max_image_patches: int = 768
     colqwen_use_binary_quantization: bool = True
@@ -255,62 +245,62 @@ class Config:
             "Support": self.rt_weight_support,
         }.get(ct, 1.0)
 
-    # ─── VLM model switcher ────────────────────────────────────────────────
-    # Update CFG.vlm_model_api in-place. mrag.vlm._answer_api and
-    # _filter_figures_api read CFG.vlm_model_api at call time, so the next
-    # ask() picks up the new model without any init_pipeline() restart.
+    # ────────────────────────────────────────────────────────────────────
+    # Prompt-style runtime switchers (stp2_v1).
+    # No kernel restart needed — vlm.py reads CFG.prompt_style_* at call time.
+    # ────────────────────────────────────────────────────────────────────
 
-    def set_vlm_model(self, alias_or_id: str, verbose: bool = True) -> str:
-        """Switch the DashScope model used by the API path.
+    def set_answer_style(self, style: str) -> str:
+        """Switch the answer-prompt style. Valid: zeroshot, oneshot, fewshot, cot.
 
-        Accepts either a curated alias (a key of VLM_API_MODELS) or a raw
-        DashScope model ID string. Returns the resolved model ID.
-
-        Raises ValueError if the input is neither a known alias nor a
-        plausible DashScope model ID (basic safety check).
+        Returns the new style on success. Raises ValueError on unknown style.
         """
-        alias_or_id = alias_or_id.strip()
-        if alias_or_id in VLM_API_MODELS:
-            resolved = VLM_API_MODELS[alias_or_id]
-            via = f"alias '{alias_or_id}'"
-        else:
-            # Treat as raw ID. Sanity-check it isn't obviously bogus.
-            if not alias_or_id or " " in alias_or_id:
-                raise ValueError(
-                    f"{alias_or_id!r} is neither a known alias nor a valid "
-                    f"DashScope model id. Aliases: {list(VLM_API_MODELS)}"
-                )
-            resolved = alias_or_id
-            via = "raw id"
-        prev = self.vlm_model_api
-        self.vlm_model_api = resolved
-        if verbose:
-            print(f"[CFG] vlm_model_api: {prev!r} -> {resolved!r}  (via {via})")
-            if alias_or_id in ("glm", "kimi") or resolved in ("glm-5.2",
-                                                              "kimi-k2.7-code"):
-                print(f"[CFG] WARNING: {resolved!r} is text-only on this "
-                      "account. ask() will fail when it sends images.")
-        return resolved
+        style = (style or "").strip().lower()
+        if style not in ANSWER_STYLES_AVAILABLE:
+            raise ValueError(
+                f"Unknown answer style {style!r}. "
+                f"Available: {list(ANSWER_STYLES_AVAILABLE)}"
+            )
+        self.prompt_style_answer = style
+        log.info("CFG.prompt_style_answer → %s", style)
+        return style
 
-    def list_vlm_models(self) -> None:
-        """Pretty-print the curated catalog, marking which one is active."""
-        current = self.vlm_model_api
-        print(f"Curated DashScope models (current = {current!r}):\n")
-        # Group: VL first, non-VL last
-        vl_aliases   = [k for k, v in VLM_API_MODELS.items()
-                        if k not in ("glm", "kimi")]
-        text_aliases = [k for k in ("glm", "kimi") if k in VLM_API_MODELS]
-        for k in vl_aliases:
-            v = VLM_API_MODELS[k]
-            mark = "  ← current" if v == current else ""
-            print(f"  {k:20s} {v}{mark}")
-        if text_aliases:
-            print("\n  (TEXT-ONLY — will fail on image inputs)")
-            for k in text_aliases:
-                v = VLM_API_MODELS[k]
-                mark = "  ← current" if v == current else ""
-                print(f"  {k:20s} {v}{mark}")
-        if current not in VLM_API_MODELS.values():
-            print(f"\n  (current model is not in catalog: raw id {current!r})")
+    def set_filter_style(self, style: str) -> str:
+        """Switch the figure-filter-prompt style. Only 'zeroshot' currently supported.
+
+        Other values are silently accepted (with a warning) so future expansion
+        is non-breaking, but vlm.py will fall back to zeroshot until a matching
+        assembler is implemented.
+        """
+        style = (style or "").strip().lower()
+        if style not in FILTER_STYLES_AVAILABLE:
+            log.warning(
+                "Filter style %r is not implemented yet; setting flag but "
+                "vlm.py will use zeroshot. Implemented: %s",
+                style, list(FILTER_STYLES_AVAILABLE),
+            )
+        self.prompt_style_filter = style
+        log.info("CFG.prompt_style_filter → %s", style)
+        return style
+
+    def list_prompt_styles(self) -> dict:
+        """Return a dict describing current selections and available styles.
+
+        Also logs at INFO so a bare call in the notebook prints something useful.
+        """
+        info = {
+            "answer": {
+                "current":   self.prompt_style_answer,
+                "available": list(ANSWER_STYLES_AVAILABLE),
+            },
+            "filter": {
+                "current":   self.prompt_style_filter,
+                "available": list(FILTER_STYLES_AVAILABLE),
+            },
+            "fewshot_num_examples": self.fewshot_num_examples,
+        }
+        log.info("Prompt styles: %s", info)
+        return info
+
 
 CFG = Config()
