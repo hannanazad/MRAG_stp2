@@ -1,0 +1,125 @@
+# MUTCD Multimodal RAG (v3) — pinned requirements
+# Tested with Python 3.12 on Google Colab (A100) and TAMU HPRC Grace.
+#
+# IMPORTANT — install order matters because pip's bulk -r resolver
+# silently skips enforcing CEILINGS when a satisfying lower-bound
+# version of a package is already installed. The Colab / HPRC base
+# images all ship newer transformers / huggingface_hub / tokenizers /
+# torchao than this file allows, so a plain `pip install -r` will NOT
+# downgrade them and BGE-M3 / sentence-transformers will fail with a
+# misleading "cannot import PreTrainedModel" error.
+#
+# Colab install order (see notebook's setup cell):
+#   1. !pip install --index-url https://download.pytorch.org/whl/cu124 \
+#        torch==2.6.0 torchvision==0.21.0
+#   2. !pip install -r requirements.txt
+#   3. !pip install --no-deps --force-reinstall \
+#        "transformers>=4.49,<4.55" \
+#        "huggingface_hub>=0.34,<0.35" \
+#        "tokenizers>=0.21,<0.22" \
+#        "torchao>=0.13,<0.14"
+#
+# HPRC install order:
+#   1. activate the conda env (source activate $SCRATCH/envs/mrag)
+#   2. install torch + torchvision matching your CUDA module FIRST:
+#        pip install --index-url https://download.pytorch.org/whl/cu124 \
+#            torch==2.6.0 torchvision==0.21.0
+#      (substitute cu121/cu126 if your module's CUDA differs)
+#   3. pip install -r requirements.txt
+#   4. same force-reinstall step as Colab step 3 above.
+
+# ----- Core ML stack ---------------------------------------------------------
+# torch 2.6.0+ is REQUIRED. transformers 4.54.1 contains a runtime check
+# (CVE-2025-32434) that refuses to use torch.load on .bin checkpoints when
+# torch < 2.6. BGE-M3 and many other HF models ship .bin, so the load
+# would fail with `ValueError: Due to a serious vulnerability issue ...
+# we now require users to upgrade torch to at least v2.6`.
+torch>=2.6,<2.7
+torchvision>=0.21,<0.22
+
+# Transformers — pinned <4.55 deliberately. transformers 4.55+ has had
+# repeated releases (through at least 4.57.6 as of June 2026) with
+# circular-import regressions that break `from transformers import
+# PreTrainedModel`, required by FlagEmbedding and sentence-transformers
+# at import time. Known, still-unresolved upstream issue — see
+# https://github.com/huggingface/transformers/issues/42548 and
+# https://github.com/QwenLM/Qwen3-VL/issues/1882.
+transformers>=4.49,<4.55
+
+# huggingface_hub — must be BOTH:
+#   >=0.34   transformers 4.54.1 has a dependency_versions_check that
+#            REFUSES to import if hub < 0.34. Anything older triggers
+#            `ImportError: huggingface-hub>=0.34.0,<1.0 is required ...`.
+#   <0.35    hub 0.35+ removed several internal APIs that transformers
+#            4.54.1 still uses; with hub >=0.35 transformers' __init__
+#            partially fails and `PreTrainedModel` never gets exposed,
+#            producing the same misleading import error as the <4.55
+#            ceiling bug.
+huggingface_hub>=0.34,<0.35
+
+# tokenizers — matched to transformers 4.54.x's declared range.
+tokenizers>=0.21,<0.22
+
+# accelerate — NO upper ceiling. mxbai-rerank 0.1.x depends on
+# accelerate>=1.5.1, so pinning <1.5 produces an unsolvable
+# ResolutionImpossible against mxbai-rerank.
+accelerate>=0.33
+
+safetensors>=0.4.3
+qwen-vl-utils>=0.0.8
+
+# torchao — 0.13.x is the LAST release line that supports torch 2.6.
+# Per torchao's own release notes, 0.13 is the floor for torch 2.6
+# support, and 0.14+ drops 2.6 in favour of 2.7+. Newer torchao
+# references `torch.int1` (added in torch 2.7) at import time and
+# crashes immediately on torch 2.6, which transitively breaks
+# transformers (modeling_utils does `from torchao.quantization import
+# Int4WeightOnlyConfig` at the top, with no try/except).
+torchao>=0.13,<0.14
+
+# ----- API-mode VLM (Qwen3-VL via DashScope, or any OpenAI-compatible API) --
+openai>=1.40
+
+# ----- Retrieval models ------------------------------------------------------
+# BGE-M3 (dense + sparse + colbert in one model)
+#
+# Pinned >=1.4 specifically (not just >=1.3). FlagEmbedding 1.3.2 and
+# 1.3.3 hard-pin transformers==4.44.2 exactly, which conflicts with our
+# transformers<4.55,>=4.49 range and sends pip's resolver backtracking
+# through every old FlagEmbedding release trying to satisfy both —
+# causing "ResolutionImpossible".
+#
+# NOTE: FlagEmbedding 1.4+ passes a `dtype=` kwarg to AutoModel.from_pretrained
+# that transformers 4.54.x doesn't accept on every model class (e.g.
+# XLMRobertaModel), so BGEM3FlagModel() can raise TypeError on load.
+# embeddings.py wraps that in try/except and falls back to
+# sentence-transformers' dense-only path automatically. Sparse signal
+# is lost in that case, but the pipeline functions end-to-end.
+FlagEmbedding>=1.4,<2.0
+sentence-transformers>=3.0,<5.0   # fallback dense-only path; 4.x and 5.x are compatible
+
+# ColPali / ColQwen2 multi-vector visual retriever
+colpali-engine>=0.3.5,<0.4
+
+# Mixedbread reranker (best open accuracy as of 2026 Q1)
+mxbai-rerank>=0.1.0
+
+# ftfy / regex needed for CLIP-style tokenizers on some sentence-transformers paths
+ftfy>=6.1
+regex>=2024.4
+
+# ----- Vector DB -------------------------------------------------------------
+qdrant-client>=1.10,<2.0
+
+# ----- Knowledge graph -------------------------------------------------------
+networkx>=3.2,<4.0
+
+# ----- PDF + images ----------------------------------------------------------
+pymupdf>=1.24,<2.0
+pillow>=10.0,<12.0
+numpy>=1.26,<3.0
+tqdm>=4.66
+
+# ----- Jupyter / display ----------------------------------------------------
+ipykernel>=6.29
+ipywidgets>=8.1
