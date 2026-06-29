@@ -60,6 +60,42 @@ def _default_hf_home(env: str, base: Path) -> Path:
         return Path(os.environ["SCRATCH"]) / "hf_cache"
     return base / "hf_cache"
 
+
+# =============================================================================
+# Curated catalog of DashScope models you can swap to from the notebook.
+#
+# Switch by calling CFG.set_vlm_model("<alias>") or CFG.set_vlm_model("<raw id>").
+# `CFG.vlm_model_api` is read at call time by mrag.vlm._answer_api and
+# _filter_figures_api, so the next ask() picks up the change with no
+# init_pipeline() restart.
+#
+# IMPORTANT: glm-5.2 and kimi-k2.7-code are TEXT-ONLY on this DashScope
+# account (they aren't in the GET /models 'vl' list). If you switch to
+# them, the figure-filter call AND the answer call WILL fail with
+# 400 InvalidParameter the moment they receive images. Use them only
+# for a text-only baseline (you'd need to call them outside ask()).
+# Left in the catalog because they were requested for comparison.
+# =============================================================================
+VLM_API_MODELS: dict[str, str] = {
+    # ─── Qwen3-VL flagship (vision-language) ─────────────────────────────
+    "flagship":          "qwen3-vl-235b-a22b-instruct",
+    "flagship_thinking": "qwen3-vl-235b-a22b-thinking",
+    # ─── Qwen3-VL plus tier ──────────────────────────────────────────────
+    "plus_pinned":       "qwen3-vl-plus-2025-12-19",
+    "plus":              "qwen3-vl-plus",
+    # ─── Qwen-VL max (older top tier) ────────────────────────────────────
+    "max":               "qwen-vl-max",
+    # ─── Qwen3-VL flash (cheap + fast) ───────────────────────────────────
+    "flash_pinned":      "qwen3-vl-flash-2026-01-22",
+    "flash":             "qwen3-vl-flash",
+    # ─── Qwen-VL plus legacy (Qwen2.x era) ───────────────────────────────
+    "plus_legacy":       "qwen-vl-plus",
+    # ─── Non-VL comparison points (TEXT ONLY — see warning above) ────────
+    "glm":               "glm-5.2",
+    "kimi":              "kimi-k2.7-code",
+}
+
+
 @dataclass
 class Config:
     # ----- Paths ------------------------------------------------------------
@@ -91,10 +127,14 @@ class Config:
     # behaviour, unchanged).
     # "api" → call an OpenAI-compatible REST endpoint instead. No GPU,
     # no local download. Set vlm_model_api / api_base_url below.
-    vlm_provider: str = "api"  # "api" or "local" — default is api (Qwen3-VL-32B via DashScope)
+    vlm_provider: str = "api"  # "api" or "local" — default is api (Qwen3-VL via DashScope)
 
     # Model name string sent to the API endpoint when vlm_provider == "api".
-    vlm_model_api: str = "qwen3-vl-32b-instruct"
+    # Default is qwen3-vl-plus-2025-12-19 — a Qwen3-VL "plus" tier dated
+    # snapshot known to be entitled on this account. Switch on demand from
+    # the notebook with CFG.set_vlm_model("<alias>") — see VLM_API_MODELS
+    # above for the curated catalog (flagship / flash / max / etc.).
+    vlm_model_api: str = "qwen3-vl-plus-2025-12-19"
 
     # OpenAI-compatible API endpoint. INTERNATIONAL DashScope URL — use this
     # unless your Alibaba Cloud account is registered in mainland China.
@@ -214,5 +254,63 @@ class Config:
             "Option": self.rt_weight_option,
             "Support": self.rt_weight_support,
         }.get(ct, 1.0)
+
+    # ─── VLM model switcher ────────────────────────────────────────────────
+    # Update CFG.vlm_model_api in-place. mrag.vlm._answer_api and
+    # _filter_figures_api read CFG.vlm_model_api at call time, so the next
+    # ask() picks up the new model without any init_pipeline() restart.
+
+    def set_vlm_model(self, alias_or_id: str, verbose: bool = True) -> str:
+        """Switch the DashScope model used by the API path.
+
+        Accepts either a curated alias (a key of VLM_API_MODELS) or a raw
+        DashScope model ID string. Returns the resolved model ID.
+
+        Raises ValueError if the input is neither a known alias nor a
+        plausible DashScope model ID (basic safety check).
+        """
+        alias_or_id = alias_or_id.strip()
+        if alias_or_id in VLM_API_MODELS:
+            resolved = VLM_API_MODELS[alias_or_id]
+            via = f"alias '{alias_or_id}'"
+        else:
+            # Treat as raw ID. Sanity-check it isn't obviously bogus.
+            if not alias_or_id or " " in alias_or_id:
+                raise ValueError(
+                    f"{alias_or_id!r} is neither a known alias nor a valid "
+                    f"DashScope model id. Aliases: {list(VLM_API_MODELS)}"
+                )
+            resolved = alias_or_id
+            via = "raw id"
+        prev = self.vlm_model_api
+        self.vlm_model_api = resolved
+        if verbose:
+            print(f"[CFG] vlm_model_api: {prev!r} -> {resolved!r}  (via {via})")
+            if alias_or_id in ("glm", "kimi") or resolved in ("glm-5.2",
+                                                              "kimi-k2.7-code"):
+                print(f"[CFG] WARNING: {resolved!r} is text-only on this "
+                      "account. ask() will fail when it sends images.")
+        return resolved
+
+    def list_vlm_models(self) -> None:
+        """Pretty-print the curated catalog, marking which one is active."""
+        current = self.vlm_model_api
+        print(f"Curated DashScope models (current = {current!r}):\n")
+        # Group: VL first, non-VL last
+        vl_aliases   = [k for k, v in VLM_API_MODELS.items()
+                        if k not in ("glm", "kimi")]
+        text_aliases = [k for k in ("glm", "kimi") if k in VLM_API_MODELS]
+        for k in vl_aliases:
+            v = VLM_API_MODELS[k]
+            mark = "  ← current" if v == current else ""
+            print(f"  {k:20s} {v}{mark}")
+        if text_aliases:
+            print("\n  (TEXT-ONLY — will fail on image inputs)")
+            for k in text_aliases:
+                v = VLM_API_MODELS[k]
+                mark = "  ← current" if v == current else ""
+                print(f"  {k:20s} {v}{mark}")
+        if current not in VLM_API_MODELS.values():
+            print(f"\n  (current model is not in catalog: raw id {current!r})")
 
 CFG = Config()
