@@ -180,6 +180,8 @@ def write_jsonl(records: List[FigureRecord], path: Path) -> None:
 
 
 def read_jsonl(path: Path) -> List[FigureRecord]:
+    """Schema-tolerant reader: v1 rows (no sheet/chapter/... fields) load
+    with defaults so version checks and migrations never crash on old data."""
     out: List[FigureRecord] = []
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
@@ -187,6 +189,12 @@ def read_jsonl(path: Path) -> List[FigureRecord]:
                 continue
             d = json.loads(line)
             d.pop("referenced_in_chunks", None)   # v1 field, dropped in v2
+            d.setdefault("sheet", None)
+            d.setdefault("sheet_of", None)
+            d.setdefault("chapter", chapter_of(d.get("canonical_id", "") or "?"))
+            d.setdefault("extraction_method", "caption_above_v1")
+            d.setdefault("sign_codes_depicted", [])
+            d.setdefault("anchor_section", "")
             out.append(FigureRecord(**d))
     return out
 

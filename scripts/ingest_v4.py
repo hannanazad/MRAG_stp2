@@ -83,11 +83,22 @@ def _invalidate_embedding_caches(*names: str):
             log.warning("invalidated stale embedding cache: %s", p)
 
 
+def _figures_jsonl_is_v2(path: Path) -> bool:
+    """Cheap version peek on the first row — never parses into dataclasses,
+    so a v1 file with missing v2 fields can't crash the check."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            first = json.loads(next(f))
+        return str(first.get("extraction_method", "")).startswith("caption_below_v2")
+    except Exception:
+        return False
+
+
 def step_extract_figures_v4(min_coverage: float):
     """Extract -> rescue -> validate. The single most important change in v4."""
     if CFG.figures_jsonl.exists():
-        figs = F.read_jsonl(CFG.figures_jsonl)
-        if figs and figs[0].extraction_method.startswith("caption_below_v2"):
+        if _figures_jsonl_is_v2(CFG.figures_jsonl):
+            figs = F.read_jsonl(CFG.figures_jsonl)
             log.info("figures.jsonl is already v2 (%d crops); skipping "
                      "extraction (delete to redo)", len(figs))
             return figs
