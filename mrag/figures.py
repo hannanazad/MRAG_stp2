@@ -1,47 +1,48 @@
-"""Caption-anchored figure / table extraction.
+"""MUTCD figure / table extraction — v2 (caption-below-region, dual backend).
 
-For every 'Figure X-Y' or 'Table X-Y' caption found in the PDF, crop the
-corresponding region above (figure) or below (table) and save as a PNG.
-Output is one row per real figure/table, not per page.
+Replaces the v1 extractor whose inverted region logic (crop ABOVE caption)
+dropped or mis-cropped a large share of MUTCD figures. See figure_core.py
+for the rule set and the post-mortem.
 
-The bounding box logic is intentionally simple — for layout-pathological
-pages we accept some over-crop in exchange for zero ML dependencies and
-fully deterministic, debuggable output.
+Backends
+--------
+  * "fitz"    — PyMuPDF. Fast; use in Colab / HPRC.  (pip install pymupdf)
+  * "poppler" — pdftotext -bbox-layout + pdftoppm + Pillow. No compiled PDF
+                deps beyond poppler-utils; used for validation and as a
+                fallback when PyMuPDF is unavailable.
+
+Both backends feed the SAME geometry in figure_core.py, so validation done
+with one holds for the other.
+
+Public API (superset of v1 — ingest scripts keep working):
+    extract_figures(pdf_path, out_dir, dpi=220, backend="auto") -> List[FigureRecord]
+    render_pages(pdf_path, out_dir, dpi=180) -> int
+    write_jsonl(records, path) / read_jsonl(path)
+    validate_coverage(records, full_text, fail_below=0.98) -> dict
 """
 from __future__ import annotations
 
 import json
+import logging
 import re
-from dataclasses import dataclass, asdict, field
+import subprocess
+import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Iterator, List, Optional
+from typing import Dict, List, Optional
 
-import fitz
-
-
-CAPTION_RE = re.compile(
-    r"^\s*(Figure|Table)\s+"
-    r"([A-Z]?\d+[A-Z]?-\d+(?:\([A-Za-z0-9]+\))?[A-Za-z0-9]*)"
-    r"\s*[.\u2014:-]?\s*(.{0,250})",
-    re.IGNORECASE,
+from .figure_core import (
+    CaptionHit, FigureRecord, parse_caption_line, parse_midline_caption,
+    regions_for_page, coverage_report, chapter_of, is_toc_page, MENTION_RE,
 )
-SKIP_LINE_RE = re.compile(r"page\s+\d+|chapter\s+\d", re.IGNORECASE)
 
+log = logging.getLogger("mrag.figures")
 
-@dataclass
-class FigureRecord:
-    figure_id:           str            # e.g. "Figure 2B-1" or "Table 2B-1"
-    kind:                str            # "Figure" or "Table"
-    canonical_id:        str            # e.g. "2B-1"
-    page_pdf:            int
-    page_printed:        str
-    caption:             str
-    title:               str
-    image_path:          str
-    bbox:                List[float]    # [x0,y0,x1,y1] in PDF points
-    dpi:                 int
-    sign_codes_depicted: List[str] = field(default_factory=list)
-    referenced_in_chunks: List[str] = field(default_factory=list)
+try:
+    import fitz  # PyMuPDF
+    _HAS_FITZ = True
+except Exception:                                     # pragma: no cover
+    fitz = None
+    _HAS_FITZ = False
 
 
 # --------------------------------------------------------------------------- #
@@ -52,123 +53,326 @@ def extract_figures(
     pdf_path: Path,
     out_dir: Path,
     dpi: int = 220,
-    min_h: float = 60.0,
-    min_w: float = 80.0,
+    backend: str = "auto",
+    page_whitelist: Optional[List[int]] = None,
 ) -> List[FigureRecord]:
-    """Walk the PDF, write one PNG per caption-anchored region."""
-    pdf_path = Path(pdf_path); out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    doc = fitz.open(str(pdf_path))
-    mat = fitz.Matrix(dpi / 72.0, dpi / 72.0)
+    """Extract one PNG crop per caption-anchored region (R1–R3).
 
-    out: List[FigureRecord] = []
-    for p_idx in range(doc.page_count):
-        page = doc.load_page(p_idx)
-        captions = _find_captions(page)
-        if not captions:
-            continue
-        captions.sort(key=lambda c: c["bbox"][1])
-        for i, cap in enumerate(captions):
-            if cap["kind"].lower() == "figure":
-                rect = _figure_region(captions, i, page.rect)
-            else:
-                rect = _table_region(captions, i, page.rect)
-            if rect.is_empty or rect.height < min_h or rect.width < min_w:
-                continue
-            pix = page.get_pixmap(matrix=mat, clip=rect, alpha=False)
-            fname = f"{cap['kind'].lower()}_{_safe(cap['id'])}_p{p_idx+1:04d}.png"
-            out_path = out_dir / fname
-            pix.save(str(out_path))
-            out.append(FigureRecord(
-                figure_id=f"{cap['kind']} {cap['id']}",
-                kind=cap["kind"],
-                canonical_id=cap["id"],
-                page_pdf=p_idx + 1,
-                page_printed=page.get_label() or str(p_idx + 1),
-                caption=cap["text"],
-                title=cap["title"],
-                image_path=str(out_path),
-                bbox=[rect.x0, rect.y0, rect.x1, rect.y1],
-                dpi=dpi,
-            ))
-    return out
+    `page_whitelist` (1-based) restricts work to given pages — used by the
+    validation harness and by targeted re-extraction of individual figures.
+    """
+    pdf_path, out_dir = Path(pdf_path), Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if backend == "auto":
+        backend = "fitz" if _HAS_FITZ else "poppler"
+    log.info("figure extraction v2 — backend=%s dpi=%d", backend, dpi)
+    if backend == "fitz":
+        recs = _extract_fitz(pdf_path, out_dir, dpi, page_whitelist)
+    elif backend == "poppler":
+        recs = _extract_poppler(pdf_path, out_dir, dpi, page_whitelist)
+    else:
+        raise ValueError(f"unknown backend {backend!r}")
+    log.info("extracted %d crops covering %d canonical ids",
+             len(recs), len({(r.kind, r.canonical_id) for r in recs}))
+    return recs
+
+
+def rescue_missing(
+    records: List[FigureRecord],
+    full_text: str,
+    pdf_path: Path,
+    out_dir: Path,
+    dpi: int = 220,
+    backend: str = "auto",
+    relaxed_min_h: float = 24.0,
+) -> List[FigureRecord]:
+    """Second-chance pass for ids with ZERO crops after the main extraction.
+
+    Some MUTCD tables are physically tiny (e.g. Table 2A-3, ~40 pt tall inset)
+    and fall under MIN_REGION_H, which exists to reject degenerate junk. Rather
+    than weaken the guard globally, re-run ONLY the caption pages of missing
+    ids with a relaxed minimum and keep just those ids' crops. Returns the
+    records that were added (already appended to `records`)."""
+    from .figure_core import normalize_dashes
+    rep = coverage_report(records, full_text)
+    missing = {("Figure", cid) for cid in rep["Figure"]["missing"]}
+    missing |= {("Table", cid) for cid in rep["Table"]["missing"]}
+    if not missing:
+        return []
+    norm = normalize_dashes(full_text)
+    pages_todo = set()
+    for i, ptxt in enumerate(norm.split("\f"), 1):
+        for kind, cid in missing:
+            if re.search(rf"{kind}\s+{re.escape(cid)}\.", ptxt, re.IGNORECASE):
+                pages_todo.add(i)
+    if not pages_todo:
+        log.warning("rescue: no caption pages found for %s", sorted(missing))
+        return []
+    if backend == "auto":
+        backend = "fitz" if _HAS_FITZ else "poppler"
+    fn = _extract_fitz if backend == "fitz" else _extract_poppler
+    cand = fn(pdf_path, out_dir, dpi, sorted(pages_todo), min_h=relaxed_min_h)
+    added = [r for r in cand if (r.kind, r.canonical_id) in missing]
+    for r in added:
+        r.extraction_method = "caption_below_v2_rescued"
+    records.extend(added)
+    log.info("rescue: recovered %d crops for %s",
+             len(added), sorted({(r.kind, r.canonical_id) for r in added}))
+    return added
+
+
+def validate_coverage(records: List[FigureRecord], full_text: str,
+                      fail_below: float = 0.98) -> dict:
+    """R4 — compare extracted ids to every textual mention. Raises if
+    figure coverage < fail_below so ingestion can never silently ship a gap."""
+    rep = coverage_report(records, full_text)
+    for kind in ("Figure", "Table"):
+        r = rep[kind]
+        log.info("%s coverage: %d/%d (%.1f%%)  missing=%s",
+                 kind, r["extracted"], r["mentioned"],
+                 100 * r["coverage"], r["missing"][:10])
+    if rep["Figure"]["coverage"] < fail_below:
+        raise RuntimeError(
+            f"Figure coverage {rep['Figure']['coverage']:.2%} below "
+            f"{fail_below:.0%}. Missing: {rep['Figure']['missing']}")
+    return rep
 
 
 def render_pages(pdf_path: Path, out_dir: Path, dpi: int = 180) -> int:
-    """Render any missing page PNGs at the given DPI. Returns count rendered."""
-    pdf_path = Path(pdf_path); out_dir = Path(out_dir)
+    """Render any missing page PNGs (used by ColPali page retrieval)."""
+    pdf_path, out_dir = Path(pdf_path), Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    doc = fitz.open(str(pdf_path))
-    mat = fitz.Matrix(dpi / 72.0, dpi / 72.0)
+    if _HAS_FITZ:
+        doc = fitz.open(str(pdf_path))
+        mat = fitz.Matrix(dpi / 72.0, dpi / 72.0)
+        rendered = 0
+        for i in range(doc.page_count):
+            out = out_dir / f"page_{i + 1:04d}.png"
+            if out.exists():
+                continue
+            doc.load_page(i).get_pixmap(matrix=mat, alpha=False).save(str(out))
+            rendered += 1
+        return rendered
+    # poppler fallback
+    n_pages = _poppler_page_count(pdf_path)
     rendered = 0
-    for i in range(doc.page_count):
-        out = out_dir / f"page_{i + 1:04d}.png"
+    for i in range(1, n_pages + 1):
+        out = out_dir / f"page_{i:04d}.png"
         if out.exists():
             continue
-        doc.load_page(i).get_pixmap(matrix=mat, alpha=False).save(str(out))
+        subprocess.run(
+            ["pdftoppm", "-png", "-r", str(dpi), "-f", str(i), "-l", str(i),
+             str(pdf_path), str(out_dir / f"page_{i:04d}_tmp")],
+            check=True, capture_output=True)
+        tmp = sorted(out_dir.glob(f"page_{i:04d}_tmp*"))
+        if tmp:
+            tmp[0].rename(out)
         rendered += 1
     return rendered
 
 
-def write_jsonl(figs: List[FigureRecord], path: Path) -> None:
+def write_jsonl(records: List[FigureRecord], path: Path) -> None:
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
-        for r in figs:
-            f.write(json.dumps(asdict(r), ensure_ascii=False) + "\n")
+        for r in records:
+            f.write(json.dumps(r.to_dict(), ensure_ascii=False) + "\n")
 
 
 def read_jsonl(path: Path) -> List[FigureRecord]:
     out: List[FigureRecord] = []
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
-            if not line.strip(): continue
-            out.append(FigureRecord(**json.loads(line)))
+            if not line.strip():
+                continue
+            d = json.loads(line)
+            d.pop("referenced_in_chunks", None)   # v1 field, dropped in v2
+            out.append(FigureRecord(**d))
     return out
 
 
 # --------------------------------------------------------------------------- #
-# Internals                                                                   #
+# fitz backend (production)                                                   #
 # --------------------------------------------------------------------------- #
 
-def _find_captions(page: fitz.Page):
-    out = []
-    for block in page.get_text("dict").get("blocks", []):
-        if block.get("type") != 0:
+def _extract_fitz(pdf_path, out_dir, dpi, page_whitelist, min_h=None):
+    doc = fitz.open(str(pdf_path))
+    mat = fitz.Matrix(dpi / 72.0, dpi / 72.0)
+    pages = page_whitelist or range(1, doc.page_count + 1)
+    out: List[FigureRecord] = []
+    for pno in pages:
+        page = doc.load_page(pno - 1)
+        caps: List[CaptionHit] = []
+        line_texts: List[str] = []
+        for block in page.get_text("dict").get("blocks", []):
+            if block.get("type") != 0:
+                continue
+            for line in block.get("lines", []):
+                spans = line.get("spans", [])
+                text = " ".join(s["text"] for s in spans).strip()
+                line_texts.append(text)
+                bb = line["bbox"]                      # (x0, y0, x1, y1) top-left origin
+                hit = parse_caption_line(text, bb[1], bb[3], x_left=bb[0])
+                if hit is None:
+                    words = []
+                    for s in spans:
+                        sx = s["bbox"][0]
+                        for w in s["text"].split():
+                            words.append((w, sx, sx))   # approx x per span
+                    hit = parse_midline_caption(words, bb[1], bb[3],
+                                                page.rect.width)
+                if hit:
+                    caps.append(hit)
+        if not caps or is_toc_page(line_texts):
             continue
-        for line in block.get("lines", []):
-            text = " ".join(span["text"] for span in line.get("spans", [])).strip()
-            if not text or SKIP_LINE_RE.search(text):
-                continue
-            m = CAPTION_RE.match(text)
-            if not m:
-                continue
-            out.append({
-                "kind":  m.group(1).title(),
-                "id":    m.group(2).upper(),
-                "text":  text,
-                "title": m.group(3).strip(" .\u2014-:"),
-                "bbox":  tuple(line["bbox"]),
-            })
+        pw, ph = page.rect.width, page.rect.height
+        kw = {"min_h": min_h} if min_h is not None else {}
+        for cap, (x0, y0, x1, y1) in regions_for_page(caps, pw, ph, **kw):
+            rect = fitz.Rect(x0, y0, x1, y1)
+            pix = page.get_pixmap(matrix=mat, clip=rect, alpha=False)
+            fname = _crop_name(cap, pno)
+            pix.save(str(out_dir / fname))
+            out.append(_record(cap, pno,
+                               page.get_label() or str(pno),
+                               str(out_dir / fname),
+                               [x0, y0, x1, y1], dpi))
     return out
 
 
-def _figure_region(caps, i, page_rect):
-    bb = caps[i]["bbox"]
-    y_top = page_rect.y0 + 30
-    for j in range(i - 1, -1, -1):
-        if caps[j]["bbox"][3] <= bb[1]:
-            y_top = max(y_top, caps[j]["bbox"][3] + 8); break
-    return fitz.Rect(page_rect.x0 + 24, y_top, page_rect.x1 - 24, bb[1] - 4)
+# --------------------------------------------------------------------------- #
+# poppler backend (validation / fallback)                                     #
+# --------------------------------------------------------------------------- #
+
+def _extract_poppler(pdf_path, out_dir, dpi, page_whitelist, min_h=None):
+    from PIL import Image  # lazy import
+    if page_whitelist is None:
+        page_whitelist = _pages_with_caption_candidates(pdf_path)
+    out: List[FigureRecord] = []
+    labels = _poppler_page_labels(pdf_path)
+    for pno in page_whitelist:
+        caps, (pw, ph) = _poppler_captions_for_page(pdf_path, pno)
+        if not caps:
+            continue
+        kw = {"min_h": min_h} if min_h is not None else {}
+        regions = regions_for_page(caps, pw, ph, **kw)
+        if not regions:
+            continue
+        page_png = _poppler_render_page(pdf_path, pno, dpi)
+        img = Image.open(page_png)
+        scale = dpi / 72.0
+        for cap, (x0, y0, x1, y1) in regions:
+            crop = img.crop((int(x0 * scale), int(y0 * scale),
+                             int(x1 * scale), int(y1 * scale)))
+            fname = _crop_name(cap, pno)
+            crop.save(out_dir / fname)
+            out.append(_record(cap, pno, labels.get(pno, str(pno)),
+                               str(out_dir / fname), [x0, y0, x1, y1], dpi))
+        page_png.unlink(missing_ok=True)
+    return out
 
 
-def _table_region(caps, i, page_rect):
-    bb = caps[i]["bbox"]
-    y_bot = page_rect.y1 - 30
-    for j in range(i + 1, len(caps)):
-        if caps[j]["bbox"][1] >= bb[3]:
-            y_bot = min(y_bot, caps[j]["bbox"][1] - 8); break
-    return fitz.Rect(page_rect.x0 + 24, bb[3] + 4, page_rect.x1 - 24, y_bot)
+_CAND_RE = re.compile(r"\b(Figure|Table)\s+[0-9]+[A-Z]{0,2}-\d+\.", re.IGNORECASE)
 
 
-def _safe(s: str) -> str:
-    return re.sub(r"[^A-Za-z0-9._-]+", "_", s).strip("_")
+def _pages_with_caption_candidates(pdf_path) -> List[int]:
+    """Cheap full-text pass: a page is a candidate if a caption-shaped token
+    ('Figure X-Y.' — id ending in a PERIOD) appears ANYWHERE in its text.
+    The -layout text merges two-column rows into one line, so inset captions
+    never sit at line start there; an anywhere-search with the trailing
+    period keeps body references ('see Figure X-Y)') out while catching
+    every true caption page."""
+    from .figure_core import normalize_dashes
+    txt = subprocess.run(["pdftotext", "-layout", str(pdf_path), "-"],
+                         capture_output=True, text=True).stdout
+    out = []
+    for i, ptxt in enumerate(txt.split("\f"), 1):
+        if _CAND_RE.search(normalize_dashes(ptxt)):
+            out.append(i)
+    return out
+
+
+def _poppler_captions_for_page(pdf_path, pno):
+    xml = subprocess.run(
+        ["pdftotext", "-bbox-layout", "-f", str(pno), "-l", str(pno),
+         str(pdf_path), "-"],
+        capture_output=True, text=True).stdout
+    # strip default namespace for painless querying
+    xml = re.sub(r'xmlns="[^"]+"', "", xml, count=1)
+    root = ET.fromstring(xml)
+    page = root.find(".//page")
+    pw, ph = float(page.get("width")), float(page.get("height"))
+    caps: List[CaptionHit] = []
+    line_texts: List[str] = []
+    for line in page.iter("line"):
+        wlist = [(w.text or "", float(w.get("xMin")), float(w.get("xMax")))
+                 for w in line.iter("word")]
+        text = " ".join(w for w, *_ in wlist).strip()
+        line_texts.append(text)
+        y0, y1 = float(line.get("yMin")), float(line.get("yMax"))
+        x_left = wlist[0][1] if wlist else 0.0
+        hit = parse_caption_line(text, y0, y1, x_left=x_left)
+        if hit is None:
+            hit = parse_midline_caption(wlist, y0, y1, pw)
+        if hit:
+            caps.append(hit)
+    if is_toc_page(line_texts):
+        caps = []
+    return caps, (pw, ph)
+
+
+def _poppler_render_page(pdf_path, pno, dpi) -> Path:
+    prefix = Path(f"/tmp/_mrag_pg_{pno:04d}")
+    subprocess.run(["pdftoppm", "-png", "-r", str(dpi), "-f", str(pno),
+                    "-l", str(pno), str(pdf_path), str(prefix)],
+                   check=True, capture_output=True)
+    hits = sorted(Path("/tmp").glob(f"_mrag_pg_{pno:04d}*.png"))
+    return hits[0]
+
+
+def _poppler_page_count(pdf_path) -> int:
+    info = subprocess.run(["pdfinfo", str(pdf_path)],
+                          capture_output=True, text=True).stdout
+    m = re.search(r"Pages:\s+(\d+)", info)
+    return int(m.group(1))
+
+
+def _poppler_page_labels(pdf_path) -> Dict[int, str]:
+    """Printed page labels; poppler has no direct dump, approximate from the
+    'Page N' footer in the text layer (MUTCD prints it top-left)."""
+    txt = subprocess.run(["pdftotext", "-layout", str(pdf_path), "-"],
+                         capture_output=True, text=True).stdout
+    labels: Dict[int, str] = {}
+    for i, ptxt in enumerate(txt.split("\f"), 1):
+        m = re.search(r"^\s*Page\s+(\d{1,4})\s*$", ptxt, re.M)
+        if m:
+            labels[i] = m.group(1)
+    return labels
+
+
+# --------------------------------------------------------------------------- #
+# shared helpers                                                              #
+# --------------------------------------------------------------------------- #
+
+def _crop_name(cap: CaptionHit, pno: int) -> str:
+    sheet = f"_s{cap.sheet}" if cap.sheet else ""
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", cap.canonical_id)
+    return f"{cap.kind.lower()}_{safe}{sheet}_p{pno:04d}.png"
+
+
+def _record(cap: CaptionHit, pno: int, label: str, path: str,
+            bbox, dpi) -> FigureRecord:
+    return FigureRecord(
+        figure_id=f"{cap.kind} {cap.canonical_id}",
+        kind=cap.kind,
+        canonical_id=cap.canonical_id,
+        sheet=cap.sheet,
+        sheet_of=cap.sheet_of,
+        page_pdf=pno,
+        page_printed=label,
+        caption=cap.raw_text,
+        title=cap.title,
+        image_path=path,
+        bbox=list(bbox),
+        dpi=dpi,
+        chapter=chapter_of(cap.canonical_id),
+    )

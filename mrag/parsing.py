@@ -16,7 +16,10 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Iterator, List, Optional
 
-import fitz  # PyMuPDF
+try:
+    import fitz  # PyMuPDF — required only by parse_chunks()
+except Exception:                                     # pragma: no cover
+    fitz = None
 
 
 SECTION_RE   = re.compile(r"^Section\s+([0-9A-Z]+\.[0-9]+)\s+(.+)$")
@@ -65,6 +68,8 @@ class Chunk:
 
 def parse_chunks(pdf_path: Path, sign_code_re: Optional[re.Pattern] = None) -> List[Chunk]:
     """Walk the entire PDF and return every typed paragraph as a Chunk."""
+    if fitz is None:
+        raise RuntimeError("parse_chunks requires PyMuPDF: pip install pymupdf")
     doc = fitz.open(str(pdf_path))
     toc = doc.get_toc()
 
@@ -161,6 +166,10 @@ def _parse_one_section(
         nonlocal cur_body
         if section_started and cur_rule and cur_ord is not None and cur_body:
             text = re.sub(r"\s+", " ", " ".join(cur_body)).strip()
+            # Revision-1 pages use U+2011 non-breaking hyphens in ids
+            # ("Table 6B\u20112") — normalise so FIGREF/TABREF resolve.
+            text = text.translate({0x2010: "-", 0x2011: "-", 0x2012: "-",
+                                   0x2013: "-", 0x2014: "-"})
             if text:
                 cid = f"MUTCD11e_{sec_id.replace('.', '')}_{cur_rule}_{cur_ord:02d}"
                 figure_refs  = sorted(set(_normalize_id(x) for x in FIGREF_RE.findall(text)))

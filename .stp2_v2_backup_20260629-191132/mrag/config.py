@@ -66,42 +66,6 @@ def _default_hf_home(env: str, base: Path) -> Path:
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# VLM model catalog (v6) — maps short aliases to raw DashScope model ids.
-#
-# Use CFG.set_vlm_model("alias") to switch at runtime; CFG.list_vlm_models()
-# prints the catalog. vlm.py reads CFG.vlm_model_api at call time, so no
-# kernel restart is needed.
-#
-# Notes on entitlement: DashScope returns 403 AccessDenied.Unpurchased for
-# models your account isn't entitled to. Use `GET /v1/models` to enumerate
-# what is actually available — the list below is a sensible default but is
-# NOT guaranteed to be entitled on every account. The default below
-# (`qwen3-vl-plus-2025-12-19`) is widely available; the entries marked
-# (text_only) will return 400 InvalidParameter when ask() sends images.
-# ────────────────────────────────────────────────────────────────────────────
-VLM_API_MODELS: dict = {
-    # Flagship & large dense
-    "flagship":       "qwen3-vl-235b-a22b-instruct",
-    "max":            "qwen-vl-max",
-    # Plus tier
-    "qwen3-vl-plus":  "qwen3-vl-plus-2025-12-19",   # current default
-    "plus":           "qwen3-vl-plus-2025-12-19",   # alias
-    "qwen-vl-plus":   "qwen-vl-plus",
-    # Fast / cheap
-    "flash_pinned":   "qwen3-vl-flash-2026-01-22",  # cheap + fast, pinned date
-    "flash":          "qwen3-vl-flash",             # tracks latest flash
-    # Older / fallback
-    "qwen3-vl-32b":   "qwen3-vl-32b-instruct",      # often UNENTITLED
-    "qwen2.5-vl":     "qwen2.5-vl-72b-instruct",
-    # Text-only (will 400 if ask() sends figures) — kept for text-only experiments
-    "glm-5.2":        "glm-5.2",                    # (text_only)
-    "kimi-k2.7-code": "kimi-k2.7-code",             # (text_only)
-}
-
-VLM_TEXT_ONLY_ALIASES: set = {"glm-5.2", "kimi-k2.7-code"}
-
-
-# ────────────────────────────────────────────────────────────────────────────
 # Prompt-style catalogs (stp2_v1).
 #
 # Two independent flags govern how prompts are assembled at inference time:
@@ -109,7 +73,8 @@ VLM_TEXT_ONLY_ALIASES: set = {"glm-5.2", "kimi-k2.7-code"}
 #   - CFG.prompt_style_filter  → controls _filter_prompt           (P2)
 #
 # The answer prompt supports four styles; the filter prompt supports only
-# zeroshot for now.
+# zeroshot for now (extending the filter is a separate piece of work — it
+# would require demonstration images, which substantially raises token cost).
 # ────────────────────────────────────────────────────────────────────────────
 ANSWER_STYLES_AVAILABLE: tuple = ("zeroshot", "oneshot", "fewshot", "cot")
 FILTER_STYLES_AVAILABLE: tuple = ("zeroshot",)
@@ -146,12 +111,10 @@ class Config:
     # behaviour, unchanged).
     # "api" → call an OpenAI-compatible REST endpoint instead. No GPU,
     # no local download. Set vlm_model_api / api_base_url below.
-    vlm_provider: str = "api"  # "api" or "local"
+    vlm_provider: str = "api"  # "api" or "local" — default is api (Qwen3-VL-32B via DashScope)
 
     # Model name string sent to the API endpoint when vlm_provider == "api".
-    # DEFAULT changed (v6) off the often-unentitled qwen3-vl-32b-instruct.
-    # Use CFG.set_vlm_model("alias") to switch — vlm.py reads this at call time.
-    vlm_model_api: str = "qwen3-vl-plus-2025-12-19"
+    vlm_model_api: str = "qwen3-vl-32b-instruct"
 
     # OpenAI-compatible API endpoint. INTERNATIONAL DashScope URL — use this
     # unless your Alibaba Cloud account is registered in mainland China.
@@ -180,21 +143,24 @@ class Config:
     # Figure retrieval works in stages now:
     #   1. Path A — figures CITED by winning chunks (KG cross-links). High
     #      precision; count is whatever the winners cite.
-    #   2. Path C — VISUAL retrieval via ColPali over figure crops.
-    #   3. Path B — caption-text retrieval, off by default (off-topic figures).
+    #   2. Path C — VISUAL retrieval via ColPali over figure crops (NEW).
+    #      Recovers figures that are visually relevant even when no chunk
+    #      explicitly cites them.
+    #   3. Path B — caption-text retrieval, kept as a fallback only. This
+    #      was the main source of off-topic figures in the previous design,
+    #      so it's now off by default. Set use_caption_figure_fallback=True
+    #      to re-enable.
     #   4. (Optional) VLM filter that picks the visually-relevant subset.
+    #
+    # top_k_figures_candidates: how many figures to gather across paths A+B+C
+    # before any filtering. The VLM filter (if enabled) sees this many.
+    # top_k_figures: how many to actually display / pass to the answer-VLM
+    # after filtering. Was 6 (display only) in the old design.
     top_k_figures_candidates: int = 10
     top_k_figures: int = 4
     top_k_figures_visual: int = 6
     use_caption_figure_fallback: bool = False
     use_vlm_figure_filter: bool = True
-
-    # Question router (v2): decide per-query whether figure retrieval runs at
-    # all. Fixes the v1 behaviour of attaching ~4 figures to EVERY answer
-    # (measured figure precision 6%). Toggle off to reproduce v1 behaviour.
-    use_question_router: bool = True
-    router_soft_threshold: float = 0.5
-    router_use_vlm_tiebreak: bool = False
 
     top_k_pages: int = 4
 
@@ -280,64 +246,15 @@ class Config:
         }.get(ct, 1.0)
 
     # ────────────────────────────────────────────────────────────────────
-    # VLM model switcher (v6)
-    # No kernel restart needed — vlm.py reads CFG.vlm_model_api at call time.
-    # ────────────────────────────────────────────────────────────────────
-
-    def set_vlm_model(self, alias_or_id: str) -> str:
-        """Switch the VLM model. Accepts either:
-          - a short alias from VLM_API_MODELS (e.g. "flagship", "flash_pinned"), OR
-          - a raw DashScope model id (e.g. "qwen3-vl-plus-2025-12-19").
-
-        Returns the resolved raw model id that will be sent to the API.
-        """
-        alias_or_id = (alias_or_id or "").strip()
-        if not alias_or_id:
-            raise ValueError("Pass an alias or model id, e.g. 'flagship' or 'qwen-vl-max'.")
-
-        if alias_or_id in VLM_API_MODELS:
-            resolved = VLM_API_MODELS[alias_or_id]
-            if alias_or_id in VLM_TEXT_ONLY_ALIASES:
-                log.warning(
-                    "Model %r (%s) is text-only. ask() will fail with 400 "
-                    "InvalidParameter when figures are sent. Use it only for "
-                    "text-only experiments outside ask().",
-                    alias_or_id, resolved,
-                )
-        else:
-            # Treat as a raw DashScope id. We can't validate entitlement here;
-            # if it's wrong you'll get a 403 AccessDenied.Unpurchased at call time.
-            resolved = alias_or_id
-
-        self.vlm_model_api = resolved
-        log.info("CFG.vlm_model_api → %s", resolved)
-        return resolved
-
-    def list_vlm_models(self) -> dict:
-        """Show the v6 catalog plus what's currently selected. Returns the
-        catalog as a dict, and also logs a readable table at INFO so a bare
-        call in the notebook prints something useful.
-        """
-        log.info("Current vlm_model_api: %s", self.vlm_model_api)
-        log.info("Available aliases (set with CFG.set_vlm_model(alias)):")
-        col_w = max(len(k) for k in VLM_API_MODELS)
-        for alias, raw in VLM_API_MODELS.items():
-            tag = "  (text_only)" if alias in VLM_TEXT_ONLY_ALIASES else ""
-            log.info("  %s  →  %s%s", alias.ljust(col_w), raw, tag)
-        log.info("You may also pass a raw DashScope id (e.g. 'qwen-vl-max').")
-        return {
-            "current": self.vlm_model_api,
-            "catalog": dict(VLM_API_MODELS),
-            "text_only": sorted(VLM_TEXT_ONLY_ALIASES),
-        }
-
-    # ────────────────────────────────────────────────────────────────────
     # Prompt-style runtime switchers (stp2_v1).
     # No kernel restart needed — vlm.py reads CFG.prompt_style_* at call time.
     # ────────────────────────────────────────────────────────────────────
 
     def set_answer_style(self, style: str) -> str:
-        """Switch the answer-prompt style. Valid: zeroshot, oneshot, fewshot, cot."""
+        """Switch the answer-prompt style. Valid: zeroshot, oneshot, fewshot, cot.
+
+        Returns the new style on success. Raises ValueError on unknown style.
+        """
         style = (style or "").strip().lower()
         if style not in ANSWER_STYLES_AVAILABLE:
             raise ValueError(
@@ -349,7 +266,12 @@ class Config:
         return style
 
     def set_filter_style(self, style: str) -> str:
-        """Switch the figure-filter-prompt style. Only 'zeroshot' is implemented."""
+        """Switch the figure-filter-prompt style. Only 'zeroshot' currently supported.
+
+        Other values are silently accepted (with a warning) so future expansion
+        is non-breaking, but vlm.py will fall back to zeroshot until a matching
+        assembler is implemented.
+        """
         style = (style or "").strip().lower()
         if style not in FILTER_STYLES_AVAILABLE:
             log.warning(
@@ -362,7 +284,10 @@ class Config:
         return style
 
     def list_prompt_styles(self) -> dict:
-        """Return current selections + available styles. Logs at INFO too."""
+        """Return a dict describing current selections and available styles.
+
+        Also logs at INFO so a bare call in the notebook prints something useful.
+        """
         info = {
             "answer": {
                 "current":   self.prompt_style_answer,

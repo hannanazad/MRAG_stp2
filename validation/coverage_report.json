@@ -1,0 +1,21 @@
+{
+  "Figure": {
+    "mentioned": 485,
+    "extracted": 485,
+    "missing": [],
+    "extra": [],
+    "external_refs_excluded": [],
+    "coverage": 1.0
+  },
+  "Table": {
+    "mentioned": 68,
+    "extracted": 68,
+    "missing": [],
+    "extra": [],
+    "external_refs_excluded": [
+      "3-1",
+      "3-3"
+    ],
+    "coverage": 1.0
+  }
+}

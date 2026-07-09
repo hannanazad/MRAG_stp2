@@ -9,14 +9,20 @@
    │     S = α·dense + β·sparse + γ·hierarchy + δ·graph + ε·w(content_type)
    ├─ mxbai-rerank-large-v2 over top-K1 ──► top-K2 chunks
    ├─ ColQwen2 page retrieval (parallel) ─► top-K3 pages
-   └─ figures, merged from three paths:
-       Path A — cross-linked from winning chunks via the KG (`see Figure 2B-1`)
+   ├─ QUESTION ROUTER (v2) ───────────────► needs_figures? (see
+   │     mrag/question_router.py). When NO, figure paths are skipped
+   │     entirely and result.figures == [] — v1 attached ~4 figures to
+   │     every answer regardless of need (measured precision 6%).
+   └─ figures (only when the router says yes), merged from three paths:
+       Path A — cross-linked from winning chunks via the KG (`see Figure 2B-1`),
+                ordered by the rank of the citing chunk (best chunk first)
        Path C — ColQwen2 VISUAL retrieval over figure crops (added v5)
        Path B — caption-text similarity (off by default — was a major source
                 of off-topic figures; toggle via CFG.use_caption_figure_fallback)
        Deduplicated and capped at CFG.top_k_figures_candidates. Optional
        VLM-based relevance filter (CFG.use_vlm_figure_filter) prunes to
-       CFG.top_k_figures before display.
+       CFG.top_k_figures before display. Multi-sheet figures ship ALL their
+       sheet images via payload["image_paths"].
 """
 from __future__ import annotations
 
@@ -30,6 +36,7 @@ import numpy as np
 from .config import CFG
 from .embeddings import TextEmbedder, ImageEmbedder, Reranker
 from .kg import KG
+from .question_router import decide_figures
 from .vector_store import VectorStore
 
 log = logging.getLogger("mrag.retrieval")
@@ -115,11 +122,29 @@ class Retriever:
             final_chunks.append({**payload, "score": score})
         result.chunks = final_chunks
 
-        # 6. Figures — three paths (A: KG cross-links, C: visual, B: caption)
-        #    A and C are run unconditionally; B only if explicitly enabled.
+        # 6. Figures — gated by the question router (v2), then three paths
+        #    (A: KG cross-links, C: visual, B: caption fallback).
         figure_ids_seen: Set[str] = set()
         figs_out: List[Dict[str, Any]] = []
         candidate_cap = CFG.top_k_figures_candidates
+
+        if getattr(CFG, "use_question_router", True):
+            decision = decide_figures(
+                query, kg=self.kg, top_chunks=final_chunks,
+                soft_threshold=getattr(CFG, "router_soft_threshold", 0.5),
+            )
+            result.debug["figure_router"] = {
+                "needs_figures": decision.needs_figures,
+                "confidence": decision.confidence,
+                "max_figures": decision.max_figures,
+                "rules": decision.rules_fired,
+                **decision.debug,
+            }
+            if not decision.needs_figures:
+                result.figures = []
+                # 7. ColPali page retrieval still runs (used for citations),
+                #    handled below.
+                return self._finish_pages(query, result)
 
         # Path A: figures the winning chunks explicitly cite via "see Figure X-Y"
         for ch in final_chunks:
@@ -182,8 +207,10 @@ class Retriever:
                     break
 
         result.figures = figs_out
+        return self._finish_pages(query, result)
 
-        # 7. ColPali page retrieval (optional) ------------------------------
+    def _finish_pages(self, query: str, result: RetrievalResult) -> RetrievalResult:
+        """ColPali page retrieval (runs for every query, incl. no-figure ones)."""
         if self.img is not None:
             try:
                 q_mv = self.img.encode_queries([query])[0]
@@ -194,7 +221,6 @@ class Retriever:
                 ]
             except Exception as e:
                 log.warning("ColPali page retrieval failed: %r", e)
-
         return result
 
 
@@ -221,10 +247,17 @@ def _figure_payload_from_graph(kg: KG, figure_id: str) -> Optional[Dict[str, Any
     data = kg.g.nodes[node]
     return {
         "figure_id":     data.get("id", figure_id),
+        "canonical_id":  data.get("canonical_id", ""),
+        "chapter":       data.get("chapter", ""),
+        "anchor_section": data.get("anchor_section", ""),
         "page_pdf":      data.get("page_pdf"),
         "page_printed":  data.get("page_printed"),
         "caption":       data.get("caption", ""),
+        "title":         data.get("title", ""),
         "image_path":    data.get("image_path", ""),
+        "image_paths":   list(data.get("image_paths",
+                                         (data.get("image_path", ""),))),
+        "n_sheets":      data.get("n_sheets", 1),
         "sign_codes":    list(data.get("sign_codes", [])),
         "source":        "graph_link",
     }
