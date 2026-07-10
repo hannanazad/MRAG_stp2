@@ -204,33 +204,37 @@ def read_jsonl(path: Path) -> List[FigureRecord]:
 # --------------------------------------------------------------------------- #
 
 def _extract_fitz(pdf_path, out_dir, dpi, page_whitelist, min_h=None):
+    """PyMuPDF backend rebuilt on page.get_text("words") — TRUE geometric
+    word segmentation, structurally identical to the poppler bbox path that
+    was validated at 100% coverage. The previous span-join reconstruction
+    inherited PDF encoding artifacts on some Revision-1 pages (missing space
+    glyphs -> "Figure4F-1.", ids split across glyph runs -> "4F- 1"), which
+    silently dropped Figures 4F-1/2/4/5/6 on Colab."""
     doc = fitz.open(str(pdf_path))
     mat = fitz.Matrix(dpi / 72.0, dpi / 72.0)
     pages = page_whitelist or range(1, doc.page_count + 1)
     out: List[FigureRecord] = []
     for pno in pages:
         page = doc.load_page(pno - 1)
+        # words: (x0, y0, x1, y1, text, block_no, line_no, word_no)
+        by_line: Dict[tuple, list] = {}
+        for x0, y0, x1, y1, w, bno, lno, _wno in page.get_text("words"):
+            by_line.setdefault((bno, lno), []).append((w, x0, x1, y0, y1))
         caps: List[CaptionHit] = []
         line_texts: List[str] = []
-        for block in page.get_text("dict").get("blocks", []):
-            if block.get("type") != 0:
-                continue
-            for line in block.get("lines", []):
-                spans = line.get("spans", [])
-                text = " ".join(s["text"] for s in spans).strip()
-                line_texts.append(text)
-                bb = line["bbox"]                      # (x0, y0, x1, y1) top-left origin
-                hit = parse_caption_line(text, bb[1], bb[3], x_left=bb[0])
-                if hit is None:
-                    words = []
-                    for s in spans:
-                        sx = s["bbox"][0]
-                        for w in s["text"].split():
-                            words.append((w, sx, sx))   # approx x per span
-                    hit = parse_midline_caption(words, bb[1], bb[3],
-                                                page.rect.width)
-                if hit:
-                    caps.append(hit)
+        for key in sorted(by_line):
+            ws = sorted(by_line[key], key=lambda t: t[1])
+            text = " ".join(t[0] for t in ws)
+            line_texts.append(text)
+            ly0 = min(t[3] for t in ws)
+            ly1 = max(t[4] for t in ws)
+            hit = parse_caption_line(text, ly0, ly1, x_left=ws[0][1])
+            if hit is None:
+                hit = parse_midline_caption(
+                    [(t[0], t[1], t[2]) for t in ws],
+                    ly0, ly1, page.rect.width)
+            if hit:
+                caps.append(hit)
         if not caps or is_toc_page(line_texts):
             continue
         pw, ph = page.rect.width, page.rect.height

@@ -48,12 +48,28 @@ _DASHES = dict.fromkeys(map(ord, "\u2010\u2011\u2012\u2013\u2014"), "-")
 
 def normalize_dashes(s: str) -> str:
     return s.translate(_DASHES)
+
+
+# Some Revision-1 pages encode captions without space glyphs ("Figure4F-1.")
+# or with the id split across glyph runs ("4F- 1"). PyMuPDF reconstructs
+# these literally; poppler's geometric word rebuild hides them. Canonicalise
+# spacing around figure/table ids so both backends parse identically.
+_ID_SPACING_RE = re.compile(
+    r"(?i)\b(figure|table)\s*([0-9]+[A-Z]{0,2})\s*-\s*(\d+)")
+
+
+def canonicalize_ids(s: str) -> str:
+    return _ID_SPACING_RE.sub(lambda m: f"{m.group(1)} {m.group(2)}-{m.group(3)}", s)
 # id examples: 2B-14, 2D-26, 4T-1, 9E-12, 6H-46, 1A-1
 FIG_ID = r"([0-9]+[A-Z]{0,2}-\d+)"
+# The id-terminating PERIOD is REQUIRED: every true MUTCD caption reads
+# "Figure 2B-14. Title" / "Table 6P-1 (Sheet 1 of 2). Title", while body
+# sentences that happen to start a line ("Table 2C-1 may be used.",
+# "Figure 9D-2 shows examples...") never put a period straight after the id.
 CAPTION_RE = re.compile(
     rf"^\s*(Figure|Table)\s+{FIG_ID}"
     r"\s*(\(Sheet\s+(\d+)\s+of\s+(\d+)\))?"     # optional sheet marker
-    r"\s*[.\u2014:\u2013-]?\s*(.*)$",
+    r"\s*[.:]\s*(.*)$",
     re.IGNORECASE,
 )
 DOT_LEADER_RE = re.compile(r"\.{4,}")            # TOC dot leaders
@@ -149,7 +165,7 @@ def parse_caption_line(line_text: str, y_top: float, y_bot: float,
     """Apply grammar + R2 to one physical text line (line-start captions)."""
     if len(line_text) > MAX_CAPTION_LEN:
         return None
-    line_text = normalize_dashes(line_text)
+    line_text = canonicalize_ids(normalize_dashes(line_text))
     m = CAPTION_RE.match(line_text)
     if not m:
         return None
@@ -189,6 +205,25 @@ def parse_midline_caption(words: "Sequence[tuple]", y_top: float,
     whose x_left bounds the side-column crop.
     """
     words = [(normalize_dashes(w), x0, x1) for (w, x0, x1) in words]
+    # split fused keyword+id ("Figure4F-1.") and merge split ids ("4F-" "1.")
+    fixed = []
+    for (w, x0, x1) in words:
+        m = re.match(r"(?i)^(figure|table)([0-9].*)$", w)
+        if m:
+            fixed.append((m.group(1), x0, x0))
+            fixed.append((m.group(2), x0, x1))
+        else:
+            fixed.append((w, x0, x1))
+    merged: list = []
+    for t in fixed:
+        if (merged
+                and re.match(r"^[0-9]+[A-Z]{0,2}-$", merged[-1][0], re.IGNORECASE)
+                and re.match(r"^\d+[.,]?$", t[0])):
+            pw, px0, _ = merged[-1]
+            merged[-1] = (pw + t[0], px0, t[2])
+        else:
+            merged.append(t)
+    words = merged
     for i, (w, x0, _x1) in enumerate(words[:-1]):
         if w.lower() not in ("figure", "table"):
             continue
@@ -295,7 +330,7 @@ def mention_census(full_text: str) -> Dict[str, set]:
     """Every 'Figure X-Y' / 'Table X-Y' string in the document text.
     Ids referencing EXTERNAL documents (e.g. '2018 AASHTO Policy, Table 3-1')
     are excluded: every mention line is checked for an external-source marker."""
-    full_text = normalize_dashes(full_text)
+    full_text = canonicalize_ids(normalize_dashes(full_text))
     figs, tabs = set(), set()
     external = {"Figure": set(), "Table": set()}
     lines = full_text.split("\n")
