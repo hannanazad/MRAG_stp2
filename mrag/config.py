@@ -90,6 +90,11 @@ VLM_API_MODELS: dict = {
     # Fast / cheap
     "flash_pinned":   "qwen3-vl-flash-2026-01-22",  # cheap + fast, pinned date
     "flash":          "qwen3-vl-flash",             # tracks latest flash
+    # Challenger (v4.3): a generation newer, vision-capable omni model.
+    # BENCHMARK on the 49-QA set before trusting — omni models optimise for
+    # breadth (audio/realtime too), not necessarily document figures.
+    "challenger":         "qwen3.5-omni-plus-2026-03-15",
+    "qwen3.5-omni-plus":  "qwen3.5-omni-plus-2026-03-15",
     # Older / fallback
     "qwen3-vl-32b":   "qwen3-vl-32b-instruct",      # often UNENTITLED
     "qwen2.5-vl":     "qwen2.5-vl-72b-instruct",
@@ -220,7 +225,7 @@ class Config:
     # See module-level docstring above the dataclass for the catalogs.
     # Switch at runtime with CFG.set_answer_style(...) — no kernel restart
     # needed; vlm.py reads these at call time.
-    prompt_style_answer: str = "zeroshot"   # P1 — answer generation prompt
+    prompt_style_answer: str = "fewshot"    # P1 — answer generation prompt (v4.3 default; was zeroshot)
     prompt_style_filter: str = "zeroshot"   # P2 — figure relevance filter prompt
     fewshot_num_examples: int = 3            # how many examples to use when
                                              # prompt_style_answer == "fewshot".

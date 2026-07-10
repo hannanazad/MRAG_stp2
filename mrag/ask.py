@@ -105,10 +105,18 @@ def ask(question: str, show_text: bool = False, show_scores: bool = False,
             # No filter — still cap at the display count
             result.figures = result.figures[: CFG.top_k_figures]
 
+    # v4.3: when the question router decided NO figures are needed, the
+    # answer must be fully text-only — suppress ColPali PAGE images from the
+    # VLM prompt and from the display as well (they were leaking images into
+    # no-figure answers). Pages stay in the returned dict for eval/citations.
+    router_dec = result.debug.get("figure_router", {})
+    text_only = router_dec.get("needs_figures") is False
+
     if p.vlm is not None:
         try:
             answer = p.vlm.answer(
-                question, result.chunks, result.figures, result.pages,
+                question, result.chunks, result.figures,
+                [] if text_only else result.pages,
                 max_new_tokens=CFG.max_new_tokens,
             )
         except Exception as e:
@@ -118,7 +126,8 @@ def ask(question: str, show_text: bool = False, show_scores: bool = False,
         answer = "(VLM not loaded — `init_pipeline(load_vlm=True)`)"
 
     _display(question, answer, result, show_text=show_text,
-             show_scores=show_scores, max_fig_width=max_fig_width)
+             show_scores=show_scores, max_fig_width=max_fig_width,
+             suppress_pages=text_only)
 
     return {
         "question": question,
@@ -131,7 +140,8 @@ def ask(question: str, show_text: bool = False, show_scores: bool = False,
 
 
 def _display(question, answer, result: RetrievalResult,
-             show_text=False, show_scores=False, max_fig_width=640) -> None:
+             show_text=False, show_scores=False, max_fig_width=640,
+             suppress_pages=False) -> None:
     """Render answer + figures inline (Jupyter)."""
     try:
         from IPython.display import display, Markdown, Image as IPImage
@@ -156,7 +166,7 @@ def _display(question, answer, result: RetrievalResult,
                 ))
                 display(IPImage(filename=ip, width=max_fig_width))
 
-    if result.pages:
+    if result.pages and not suppress_pages:
         display(Markdown("### Pages retrieved by ColPali"))
         for i, p in enumerate(result.pages, 1):
             ip = p.get("image_path", "")
