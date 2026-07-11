@@ -1,0 +1,41 @@
+{
+  "schema_version": "1.0",
+  "models": [
+    {
+      "alias": "flagship",
+      "selector": "flagship",
+      "provider": "dashscope",
+      "enabled": true,
+      "metadata": {
+        "role": "primary"
+      }
+    },
+    {
+      "alias": "flash_pinned",
+      "selector": "flash_pinned",
+      "provider": "dashscope",
+      "enabled": false,
+      "metadata": {
+        "role": "fast-cost-efficient"
+      }
+    },
+    {
+      "alias": "max",
+      "selector": "max",
+      "provider": "dashscope",
+      "enabled": false,
+      "metadata": {
+        "role": "comparison"
+      }
+    },
+    {
+      "alias": "future_model_descriptive_name",
+      "selector": "provider-exact-model-id-or-CFG-alias",
+      "provider": "provider-name",
+      "enabled": false,
+      "metadata": {
+        "notes": "Add future models without changing the benchmark. Use a unique alias."
+      }
+    }
+  ]
+}
