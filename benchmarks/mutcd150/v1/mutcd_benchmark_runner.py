@@ -5,10 +5,10 @@ initialized ``CFG``, ``pipeline``, and ``ask``.  The runner never opens the
 evaluator gold file.  It accepts only the question-only JSONL.
 
 Canonical outputs in each run directory:
-  - answers_<run_id>.jsonl          one immutable record per model/question/run
+  - answers_<run_id>.jsonl          successful model answers only
   - retrieval_<run_id>.jsonl        captured RAG debug/display evidence, no image bytes
   - manifest_<run_id>.json          environment, hashes, model registry, progress
-  - errors_<run_id>.jsonl           model-switch or runner-level failures
+  - errors_<run_id>.jsonl           terminal question/model-switch failures
 
 The implementation is deliberately defensive because different versions of
 ``mrag.ask.ask`` may return a string, dictionary, dataclass, custom object, or
@@ -39,8 +39,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, MutableMapping, Optional, Sequence
 
-RUNNER_VERSION = "1.0.0"
-RUN_SCHEMA_VERSION = "1.0"
+RUNNER_VERSION = "1.1.0"
+RUN_SCHEMA_VERSION = "1.1"
 EXPECTED_BENCHMARK_VERSION = "MUTCD-150-v1.0"
 EXPECTED_QUESTION_COUNT = 150
 EXPECTED_QUESTIONS_SHA256 = "3a04b1d620a80704eefac34c565449a0cb8814e781dd6d73b8afb77318b954b2"
@@ -167,12 +167,24 @@ class CapturedCall:
     latency_ms: int
 
 
+class VLMResponseError(RuntimeError):
+    """Raised when the RAG wrapper returns an error string as if it were an answer."""
+
+
+def is_vlm_error_answer(answer: Any) -> bool:
+    if not isinstance(answer, str):
+        return False
+    text = answer.lstrip().lower()
+    return text.startswith("(vlm error:") or text.startswith("vlm error:")
+
+
 class JsonlWriter:
     """Append-only JSONL writer that flushes and fsyncs every record."""
 
     def __init__(self, path: Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.touch(exist_ok=True)
 
     def append(self, record: Mapping[str, Any]) -> None:
         line = json.dumps(record, ensure_ascii=False, sort_keys=False, default=_json_default)
@@ -689,29 +701,34 @@ def _load_completed(path: Path, rerun_errors: bool) -> set[tuple[str, str, int]]
 
 
 def _existing_answer_state(path: Path, rerun_errors: bool) -> tuple[set[tuple[str, str, int]], int, int]:
+    """Return unique successful keys from an existing answers file.
+
+    Runner v1.1 writes terminal failures only to errors JSONL. For backward
+    compatibility, status=error records created by v1.0 are ignored so the same
+    question can be retried without being treated as completed.
+    """
     completed: set[tuple[str, str, int]] = set()
-    ok_count = 0
-    error_count = 0
     if not path.exists():
-        return completed, ok_count, error_count
+        return completed, 0, 0
+    historical_error_rows = 0
     with path.open("r", encoding="utf-8") as fh:
         for raw in fh:
             if not raw.strip():
                 continue
             try:
                 row = json.loads(raw)
-                key = (str(row.get("model_id") or row["model_alias"]), str(row["question_id"]), int(row.get("replicate", 1)))
-                status = row.get("status")
-                if status == "ok":
-                    ok_count += 1
+                key = (
+                    str(row.get("model_id") or row["model_alias"]),
+                    str(row["question_id"]),
+                    int(row.get("replicate", 1)),
+                )
+                if row.get("status") == "ok":
                     completed.add(key)
                 else:
-                    error_count += 1
-                    if not rerun_errors:
-                        completed.add(key)
+                    historical_error_rows += 1
             except Exception:
                 continue
-    return completed, ok_count, error_count
+    return completed, len(completed), historical_error_rows
 
 
 def _cfg_snapshot(CFG: Any) -> dict[str, Any]:
@@ -976,6 +993,9 @@ def run_benchmark(
                     print(f"[{global_index}/{total_planned}] RUN  {model.alias} {qid} r{replicate}")
                     call_started_at = utc_now()
                     captured: Optional[CapturedCall] = None
+                    last_captured: Optional[CapturedCall] = None
+                    extracted_answer = ""
+                    extraction_method = "not_found"
                     last_exc: Optional[BaseException] = None
                     last_traceback: Optional[str] = None
                     attempt = 0
@@ -988,6 +1008,14 @@ def run_benchmark(
                                 show_scores=rcfg.show_scores,
                                 show_text=rcfg.show_text,
                             )
+                            last_captured = captured
+                            extracted_answer, extraction_method = extract_answer(captured)
+                            if is_vlm_error_answer(extracted_answer):
+                                raise VLMResponseError(extracted_answer)
+                            if not extracted_answer:
+                                raise RuntimeError(
+                                    "No answer could be extracted from return value or rendered output."
+                                )
                             last_exc = None
                             last_traceback = None
                             break
@@ -996,6 +1024,7 @@ def run_benchmark(
                         except BaseException as exc:
                             last_exc = exc
                             last_traceback = traceback.format_exc()
+                            captured = None
                             if attempt < rcfg.max_attempts:
                                 delay = rcfg.retry_base_seconds * (2 ** (attempt - 1)) + random.random()
                                 print(f"  attempt {attempt} failed ({type(exc).__name__}: {exc}); retrying in {delay:.1f}s")
@@ -1024,35 +1053,54 @@ def run_benchmark(
                     }
 
                     if last_exc is not None or captured is None:
-                        record = {
+                        error_record = {
                             **common,
                             "status": "error",
-                            "answer": "",
-                            "answer_sha256": sha256_text(""),
-                            "answer_extraction_method": "exception",
-                            "latency_ms": None,
-                            "usage": {},
+                            "stage": "question_call",
+                            "answer": extracted_answer,
+                            "answer_sha256": sha256_text(extracted_answer),
+                            "answer_extraction_method": extraction_method,
+                            "latency_ms": last_captured.latency_ms if last_captured else None,
+                            "usage": extract_usage(last_captured.return_value) if last_captured else {},
                             "error_type": type(last_exc).__name__ if last_exc else "UnknownError",
                             "error": str(last_exc) if last_exc else "Unknown error",
                             "traceback": last_traceback,
                         }
-                        answer_writer.append(record)
+                        error_writer.append(error_record)
+                        if rcfg.store_raw_debug and last_captured is not None:
+                            retrieval_writer.append({
+                                **common,
+                                "status": "error",
+                                "latency_ms": last_captured.latency_ms,
+                                "stdout": last_captured.stdout,
+                                "stderr": last_captured.stderr,
+                                "display_outputs": last_captured.display_outputs,
+                                "figure_evidence_parsed": extract_figure_evidence(last_captured),
+                                "display_output_count": len(last_captured.display_outputs),
+                                "display_image_count": sum(
+                                    1
+                                    for out in last_captured.display_outputs
+                                    for mime in (out.get("data") or {})
+                                    if str(mime).startswith("image/")
+                                ),
+                                "terminal_error_type": error_record["error_type"],
+                                "terminal_error": error_record["error"],
+                            })
                         manifest["progress"]["error_records"] += 1
-                        print(f"  ERROR: {record['error_type']}: {record['error']}")
+                        print(f"  ERROR after {attempt} attempts: {error_record['error_type']}: {error_record['error']}")
                     else:
-                        answer, extraction_method = extract_answer(captured)
+                        answer = extracted_answer
                         usage = extract_usage(captured.return_value)
-                        status = "ok" if answer else "error"
                         record = {
                             **common,
-                            "status": status,
+                            "status": "ok",
                             "answer": answer,
                             "answer_sha256": sha256_text(answer),
                             "answer_extraction_method": extraction_method,
                             "latency_ms": captured.latency_ms,
                             "usage": usage,
-                            "error_type": None if answer else "AnswerExtractionError",
-                            "error": None if answer else "No answer could be extracted from return value or rendered output.",
+                            "error_type": None,
+                            "error": None,
                         }
                         if rcfg.store_serialized_return:
                             record["serialized_return"] = _safe_serialize(captured.return_value)
@@ -1062,7 +1110,7 @@ def run_benchmark(
                         if rcfg.store_raw_debug:
                             debug_record = {
                                 **common,
-                                "status": status,
+                                "status": "ok",
                                 "latency_ms": captured.latency_ms,
                                 "stdout": captured.stdout,
                                 "stderr": captured.stderr,
@@ -1078,16 +1126,12 @@ def run_benchmark(
                             }
                             retrieval_writer.append(debug_record)
 
-                        if status == "ok":
-                            manifest["progress"]["ok_records"] += 1
-                            if rcfg.echo_answer_preview:
-                                preview = re.sub(r"\s+", " ", answer)[:240]
-                                print(f"  OK {captured.latency_ms} ms — {preview}")
-                            else:
-                                print(f"  OK {captured.latency_ms} ms — {len(answer)} chars")
+                        manifest["progress"]["ok_records"] += 1
+                        if rcfg.echo_answer_preview:
+                            preview = re.sub(r"\s+", " ", answer)[:240]
+                            print(f"  OK {captured.latency_ms} ms — {preview}")
                         else:
-                            manifest["progress"]["error_records"] += 1
-                            print("  ERROR: answer extraction failed; raw debug was retained")
+                            print(f"  OK {captured.latency_ms} ms — {len(answer)} chars")
 
                     manifest["updated_at"] = utc_now()
                     atomic_json_dump(manifest_path, manifest)
@@ -1132,18 +1176,17 @@ def run_benchmark(
 
 
 def validate_run_outputs(run_dir: str | Path, run_id: str) -> dict[str, Any]:
-    """Perform structural checks before the result files are shared."""
+    """Perform structural checks and report unresolved terminal failures."""
     run_dir = Path(run_dir)
     answers_path = run_dir / f"answers_{run_id}.jsonl"
     retrieval_path = run_dir / f"retrieval_{run_id}.jsonl"
     manifest_path = run_dir / f"manifest_{run_id}.json"
+    errors_path = run_dir / f"errors_{run_id}.jsonl"
 
     if not answers_path.exists() or not manifest_path.exists():
         raise FileNotFoundError("answers or manifest file is missing")
 
-    answers: list[dict[str, Any]] = []
-    keys: set[tuple[str, str, int]] = set()
-    duplicates: list[tuple[str, str, int]] = []
+    rows_by_key: dict[tuple[str, str, int], list[dict[str, Any]]] = {}
     with answers_path.open("r", encoding="utf-8") as fh:
         for line_no, raw in enumerate(fh, 1):
             if not raw.strip():
@@ -1153,34 +1196,65 @@ def validate_run_outputs(run_dir: str | Path, run_id: str) -> dict[str, Any]:
                 if required not in row:
                     raise ValueError(f"Missing {required!r} on answers line {line_no}")
             key = (str(row.get("model_id") or row["model_alias"]), str(row["question_id"]), int(row["replicate"]))
-            if key in keys:
-                duplicates.append(key)
-            keys.add(key)
-            answers.append(row)
+            rows_by_key.setdefault(key, []).append(row)
+
+    duplicate_ok_keys = [
+        key for key, group in rows_by_key.items()
+        if sum(row.get("status") == "ok" for row in group) > 1
+    ]
+    if duplicate_ok_keys:
+        raise ValueError(f"Multiple successful records found for the same key: {duplicate_ok_keys[:5]}")
+
+    effective_ok = {
+        key: next(row for row in reversed(group) if row.get("status") == "ok")
+        for key, group in rows_by_key.items()
+        if any(row.get("status") == "ok" for row in group)
+    }
+
+    error_events: list[dict[str, Any]] = []
+    if errors_path.exists():
+        with errors_path.open("r", encoding="utf-8") as fh:
+            for raw in fh:
+                if raw.strip():
+                    error_events.append(json.loads(raw))
+    question_error_keys = {
+        (str(row.get("model_id") or row.get("model_alias")), str(row.get("question_id")), int(row.get("replicate", 1)))
+        for row in error_events
+        if row.get("question_id")
+    }
+    unresolved = sorted(question_error_keys.difference(effective_ok))
 
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     summary = {
         "run_id": run_id,
-        "answer_records": len(answers),
-        "ok_records": sum(r.get("status") == "ok" for r in answers),
-        "error_records": sum(r.get("status") != "ok" for r in answers),
-        "unique_models": sorted({str(r["model_alias"]) for r in answers}),
-        "unique_questions": len({str(r["question_id"]) for r in answers}),
-        "duplicates": duplicates,
+        "answer_records_raw": sum(len(v) for v in rows_by_key.values()),
+        "successful_records": len(effective_ok),
+        "historical_answer_duplicates": sum(max(0, len(v) - 1) for v in rows_by_key.values()),
+        "error_events": len(error_events),
+        "unresolved_error_records": len(unresolved),
+        "unresolved_error_keys": unresolved,
+        "unique_models": sorted({str(r["model_alias"]) for r in effective_ok.values()}),
+        "unique_questions_successful": len({str(r["question_id"]) for r in effective_ok.values()}),
         "answers_sha256": sha256_file(answers_path),
         "retrieval_exists": retrieval_path.exists(),
         "retrieval_sha256": sha256_file(retrieval_path) if retrieval_path.exists() else None,
+        "errors_exists": errors_path.exists(),
+        "errors_sha256": sha256_file(errors_path) if errors_path.exists() and errors_path.stat().st_size else None,
         "manifest_status": manifest.get("status"),
         "manifest_sha256": sha256_file(manifest_path),
     }
-    if duplicates:
-        raise ValueError(f"Duplicate model-id/question/replicate records found: {duplicates[:5]}")
+    # Backward-compatible names used by existing notebook smoke assertions.
+    summary["answer_records"] = summary["successful_records"]
+    summary["ok_records"] = summary["successful_records"]
+    summary["error_records"] = summary["unresolved_error_records"]
     return summary
 
 
 __all__ = [
     "EXPECTED_BENCHMARK_VERSION",
     "EXPECTED_QUESTIONS_SHA256",
+    "VLMResponseError",
+    "is_vlm_error_answer",
     "ModelSpec",
     "RunnerConfig",
     "load_questions",

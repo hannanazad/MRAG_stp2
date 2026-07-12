@@ -1,6 +1,7 @@
 {
-  "schema_version": "1.0",
+  "schema_version": "1.1",
   "benchmark_id": "MUTCD-150-v1.0",
+  "runner_version": "1.1.0",
   "runtime_assets": {
     "questions": {
       "path": "mutcd_benchmark_questions_v1.jsonl",
@@ -9,7 +10,7 @@
     },
     "runner": {
       "path": "mutcd_benchmark_runner.py",
-      "sha256": "ed2c088349c68714f7d23457a0f0fa0cec1694b12bfa6b6950cd8ce13431189a"
+      "sha256": "cb846ea49657e6b75c3cfcec677125a3a6f28e069011870ad1a53d1f6ad9e863"
     },
     "model_registry": {
       "path": "model_registry.json",
@@ -18,17 +19,17 @@
     }
   },
   "excluded_from_runtime_repo": [
-    "mutcd_benchmark_gold_v1.jsonl",
-    "mutcd_benchmark_review_v1.csv",
+    "all gold-answer files",
+    "M-SDI annotations",
+    "review/annotation CSV files",
     "MUTCD source PDF",
     "Qdrant snapshots",
-    "API keys and credentials",
+    "API keys",
     "benchmark run outputs"
   ],
   "storage_policy": {
     "github": "versioned code, question-only benchmark, notebook, and default model registry",
-    "google_drive": "MUTCD PDF, Qdrant snapshot, caches, editable registry override, and run outputs",
-    "colab_secrets": "VLM API key and optional GitHub token",
-    "offline_evaluator": "gold answers and scoring metadata"
+    "google_drive": "MUTCD PDF, Qdrant snapshot, caches, registry override, and run outputs",
+    "offline_evaluator": "gold answers, M-SDI annotations, and scoring outputs"
   }
 }
