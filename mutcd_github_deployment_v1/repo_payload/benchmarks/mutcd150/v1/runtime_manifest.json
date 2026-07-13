@@ -1,0 +1,34 @@
+{
+  "schema_version": "1.0",
+  "benchmark_id": "MUTCD-150-v1.0",
+  "runtime_assets": {
+    "questions": {
+      "path": "mutcd_benchmark_questions_v1.jsonl",
+      "sha256": "3a04b1d620a80704eefac34c565449a0cb8814e781dd6d73b8afb77318b954b2",
+      "records": 150
+    },
+    "runner": {
+      "path": "mutcd_benchmark_runner.py",
+      "sha256": "ed2c088349c68714f7d23457a0f0fa0cec1694b12bfa6b6950cd8ce13431189a"
+    },
+    "model_registry": {
+      "path": "model_registry.json",
+      "sha256": "64451a8283332ead5fd84d3d456cd0c786a9268051c40bbfecec14536f0fe1a8",
+      "editable": true
+    }
+  },
+  "excluded_from_runtime_repo": [
+    "mutcd_benchmark_gold_v1.jsonl",
+    "mutcd_benchmark_review_v1.csv",
+    "MUTCD source PDF",
+    "Qdrant snapshots",
+    "API keys and credentials",
+    "benchmark run outputs"
+  ],
+  "storage_policy": {
+    "github": "versioned code, question-only benchmark, notebook, and default model registry",
+    "google_drive": "MUTCD PDF, Qdrant snapshot, caches, editable registry override, and run outputs",
+    "colab_secrets": "VLM API key and optional GitHub token",
+    "offline_evaluator": "gold answers and scoring metadata"
+  }
+}

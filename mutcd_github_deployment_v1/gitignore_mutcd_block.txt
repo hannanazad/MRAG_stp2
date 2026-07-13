@@ -1,0 +1,14 @@
+# BEGIN MUTCD-RAG benchmark local/runtime data
+*.pdf
+qdrant_db/
+qdrant_db.tar
+benchmark_runs/
+**/benchmark_runs/
+**/*_outputs.zip
+**/mutcd_benchmark_gold*.jsonl
+**/mutcd_benchmark_review*.csv
+.env
+.env.*
+*secret*
+*.key
+# END MUTCD-RAG benchmark local/runtime data

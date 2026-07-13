@@ -75,25 +75,40 @@ class VLM:
 
     def _load_api(self) -> None:
         try:
-            import openai
+            import openai  # noqa: F401
         except ImportError:
             raise ImportError("API mode needs the openai package: pip install openai")
-
-        env_var = getattr(CFG, "api_key_env_var", "VLM_API_KEY")
-        api_key = os.environ.get(env_var)
-        if not api_key:
-            raise EnvironmentError(
-                f"Set the environment variable '{env_var}' before calling "
-                f".load(), e.g.:\n"
-                f"  import os; os.environ['{env_var}'] = 'sk-...'"
-            )
-
-        self._api_client = openai.OpenAI(
-            api_key=api_key,
-            base_url=CFG.api_base_url,
-        )
+        self._api_clients = {}
+        # Build the client for the CURRENT model eagerly so a missing API key
+        # fails at load time with a friendly message, not mid-question.
+        self._client_for(CFG.vlm_model_api)
         self._loaded_name = CFG.vlm_model_api
         log.info("VLM (api) ready: %s @ %s", CFG.vlm_model_api, CFG.api_base_url)
+
+    def _client_for(self, model_id: str):
+        """Return an OpenAI-compatible client for the provider that serves
+        `model_id` (v4.4 multi-provider). Clients are cached per provider, so
+        switching models — or running the P2 filter on DashScope while P1
+        answers on Anthropic/Gemini — needs no reload."""
+        import openai
+        from .config import VLM_PROVIDERS, provider_of_model
+        prov = provider_of_model(model_id)
+        if prov not in getattr(self, "_api_clients", {}):
+            spec = VLM_PROVIDERS[prov]
+            api_key = os.environ.get(spec["env_var"])
+            if not api_key:
+                raise EnvironmentError(
+                    f"Model {model_id!r} is served by {prov!r}. Set the "
+                    f"environment variable '{spec['env_var']}' first, e.g.:\n"
+                    f"  import os; os.environ['{spec['env_var']}'] = '...'"
+                )
+            if not hasattr(self, "_api_clients"):
+                self._api_clients = {}
+            self._api_clients[prov] = openai.OpenAI(
+                api_key=api_key, base_url=spec["base_url"])
+            log.info("VLM client ready for provider %s @ %s",
+                     prov, spec["base_url"])
+        return self._api_clients[prov]
 
     def _load_local(self) -> None:
         import torch
@@ -184,8 +199,9 @@ class VLM:
                     "image_url": {"url": f"data:image/png;base64,{b64}"},
                 })
 
-        response = self._api_client.chat.completions.create(
-            model=CFG.vlm_model_api,
+        model_id = CFG.vlm_model_api
+        response = self._client_for(model_id).chat.completions.create(
+            model=model_id,
             messages=[{"role": "user", "content": content}],
             max_tokens=max_new_tokens,
         )
@@ -303,8 +319,9 @@ class VLM:
                 "type": "image_url",
                 "image_url": {"url": f"data:image/png;base64,{b64}"},
             })
-        response = self._api_client.chat.completions.create(
-            model=CFG.vlm_model_api,
+        filter_model = getattr(CFG, "vlm_model_filter", None) or CFG.vlm_model_api
+        response = self._client_for(filter_model).chat.completions.create(
+            model=filter_model,
             messages=[{"role": "user", "content": content}],
             max_tokens=80,  # short reply — just an index list
         )

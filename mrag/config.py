@@ -79,6 +79,48 @@ def _default_hf_home(env: str, base: Path) -> Path:
 # (`qwen3-vl-plus-2025-12-19`) is widely available; the entries marked
 # (text_only) will return 400 InvalidParameter when ask() sends images.
 # ────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Multi-provider VLM support (v4.4). All three providers expose OpenAI-
+# compatible chat-completions endpoints, so one client code path serves all;
+# only base_url and the API-key env var differ. The provider is inferred from
+# the model id prefix — no per-entry tagging needed.
+# ---------------------------------------------------------------------------
+VLM_PROVIDERS = {
+    "dashscope": {
+        "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        "env_var":  "DASHSCOPE_API_KEY",
+    },
+    "anthropic": {
+        "base_url": "https://api.anthropic.com/v1/",
+        "env_var":  "ANTHROPIC_API_KEY",
+    },
+    "gemini": {
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+        "env_var":  "GEMINI_API_KEY",
+    },
+}
+
+
+# The user-picked Qwen tiers are the GENERAL qwen3.6/3.7 line, not qwen3-vl-*.
+# Whether they accept image inputs is UNVERIFIED from here — DashScope returns
+# 400 InvalidParameter on image content for text-only models. set_vlm_model
+# emits a one-time reminder; verify with a single-image call before sweeping.
+VLM_VISION_UNVERIFIED = {
+    "qwen3.7-max-2026-06-08",
+    "qwen3.7-plus-2026-05-26",
+    "qwen3.6-flash-2026-04-16",
+}
+
+
+def provider_of_model(model_id: str) -> str:
+    m = (model_id or "").lower()
+    if m.startswith("claude"):
+        return "anthropic"
+    if m.startswith(("gemini", "gemma")):
+        return "gemini"
+    return "dashscope"
+
+
 VLM_API_MODELS: dict = {
     # Flagship & large dense
     "flagship":       "qwen3-vl-235b-a22b-instruct",
@@ -95,6 +137,29 @@ VLM_API_MODELS: dict = {
     # breadth (audio/realtime too), not necessarily document figures.
     "challenger":         "qwen3.5-omni-plus-2026-03-15",
     "qwen3.5-omni-plus":  "qwen3.5-omni-plus-2026-03-15",
+
+    # ---- Cross-provider tier matrix (v4.5, user-specified) -----------------
+    # 3 providers x 3 tiers; sweep grid = this matrix x prompt styles.
+    #                 Qwen                        Claude                        Gemini
+    # Frontier        qwen3.7-max-2026-06-08      claude-fable-5                gemini-3.1-pro-preview
+    # Balanced        qwen3.7-plus-2026-05-26     claude-sonnet-5               gemini-3.5-flash
+    # Fast/economical qwen3.6-flash-2026-04-16    claude-haiku-4-5-20251001     gemini-3.1-flash-lite
+    "frontier_qwen":     "qwen3.7-max-2026-06-08",
+    "frontier_claude":   "claude-fable-5",
+    "frontier_gemini":   "gemini-3.1-pro-preview",
+    "balanced_qwen":     "qwen3.7-plus-2026-05-26",
+    "balanced_claude":   "claude-sonnet-5",
+    "balanced_gemini":   "gemini-3.5-flash",
+    "fast_qwen":         "qwen3.6-flash-2026-04-16",
+    "fast_claude":       "claude-haiku-4-5-20251001",
+    "fast_gemini":       "gemini-3.1-flash-lite",
+    # short conveniences for the same nine
+    "fable":             "claude-fable-5",
+    "sonnet":            "claude-sonnet-5",
+    "haiku":             "claude-haiku-4-5-20251001",
+    "gemini-pro":        "gemini-3.1-pro-preview",
+    "gemini-flash":      "gemini-3.5-flash",
+    "gemini-flash-lite": "gemini-3.1-flash-lite",
     # Older / fallback
     "qwen3-vl-32b":   "qwen3-vl-32b-instruct",      # often UNENTITLED
     "qwen2.5-vl":     "qwen2.5-vl-72b-instruct",
@@ -201,6 +266,11 @@ class Config:
     router_soft_threshold: float = 0.5
     router_use_vlm_tiebreak: bool = False
 
+    # P2 figure-filter model override (v4.4). None => use vlm_model_api.
+    # Recommended during cross-provider sweeps: CFG.set_filter_model("flash_pinned")
+    # pins the filter to cheap Qwen flash while P1 runs Claude/Gemini/etc.
+    vlm_model_filter: Optional[str] = None
+
     top_k_pages: int = 4
 
     # Scoring weights:
@@ -291,9 +361,13 @@ class Config:
 
     def set_vlm_model(self, alias_or_id: str) -> str:
         """Switch the VLM model. Accepts either:
-          - a short alias from VLM_API_MODELS (e.g. "flagship", "flash_pinned"), OR
-          - a raw DashScope model id (e.g. "qwen3-vl-plus-2025-12-19").
+          - a short alias from VLM_API_MODELS (e.g. "flagship", "opus",
+            "gemini-pro"), OR
+          - a raw model id from ANY provider ("qwen3-vl-plus-2025-12-19",
+            "claude-sonnet-5", "gemini-3.5-flash").
 
+        The provider (DashScope / Anthropic / Gemini) is inferred from the id
+        prefix; base_url and API-key env var are switched automatically.
         Returns the resolved raw model id that will be sent to the API.
         """
         alias_or_id = (alias_or_id or "").strip()
@@ -315,7 +389,29 @@ class Config:
             resolved = alias_or_id
 
         self.vlm_model_api = resolved
-        log.info("CFG.vlm_model_api → %s", resolved)
+        if resolved in VLM_VISION_UNVERIFIED:
+            log.warning(
+                "Model %s is from the general Qwen line — vision capability "
+                "UNVERIFIED. Run one image call before a full sweep; if it "
+                "400s on images, switch to the qwen3-vl equivalent.", resolved)
+        prov = provider_of_model(resolved)
+        self.api_base_url = VLM_PROVIDERS[prov]["base_url"]
+        self.api_key_env_var = VLM_PROVIDERS[prov]["env_var"]
+        log.info("CFG.vlm_model_api → %s  [provider=%s]", resolved, prov)
+        return resolved
+
+    def set_filter_model(self, alias_or_id: Optional[str]) -> Optional[str]:
+        """Pin the P2 figure filter to its own model (None => follow the
+        answer model). Provider is inferred per call, so the filter can run
+        on DashScope while answers run on Anthropic/Gemini."""
+        if alias_or_id is None:
+            self.vlm_model_filter = None
+            log.info("CFG.vlm_model_filter → None (follows vlm_model_api)")
+            return None
+        resolved = VLM_API_MODELS.get(alias_or_id.strip(), alias_or_id.strip())
+        self.vlm_model_filter = resolved
+        log.info("CFG.vlm_model_filter → %s  [provider=%s]",
+                 resolved, provider_of_model(resolved))
         return resolved
 
     def list_vlm_models(self) -> dict:

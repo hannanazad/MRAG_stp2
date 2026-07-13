@@ -1,0 +1,51 @@
+{
+  "schema_version": "1.0",
+  "package": "mutcd_github_deployment_v1",
+  "files": {
+    "README.md": {
+      "sha256": "f95a5bfb53661a73157e00f274e9c2b647066c11187605976ccf4c3df13f3de1",
+      "bytes": 2797
+    },
+    "gitignore_mutcd_block.txt": {
+      "sha256": "f62dc523f6fac617753a647c78e2cb2e92faf8d97b2aea8a0b859adca9a1c44f",
+      "bytes": 264
+    },
+    "publish_to_github.sh": {
+      "sha256": "17aee7f0ad8392e98ace074dac3479ebc40d878425b8775a050968c80cf9ec7a",
+      "bytes": 3148
+    },
+    "repo_payload/benchmarks/mutcd150/v1/README.md": {
+      "sha256": "be4f27012b708c611fc838f790ba3282580e784359233ea5c58523f7cda3dec1",
+      "bytes": 934
+    },
+    "repo_payload/benchmarks/mutcd150/v1/model_registry.json": {
+      "sha256": "64451a8283332ead5fd84d3d456cd0c786a9268051c40bbfecec14536f0fe1a8",
+      "bytes": 892
+    },
+    "repo_payload/benchmarks/mutcd150/v1/mutcd_benchmark_questions_v1.jsonl": {
+      "sha256": "3a04b1d620a80704eefac34c565449a0cb8814e781dd6d73b8afb77318b954b2",
+      "bytes": 33734
+    },
+    "repo_payload/benchmarks/mutcd150/v1/mutcd_benchmark_runner.py": {
+      "sha256": "ed2c088349c68714f7d23457a0f0fa0cec1694b12bfa6b6950cd8ce13431189a",
+      "bytes": 46519
+    },
+    "repo_payload/benchmarks/mutcd150/v1/runtime_manifest.json": {
+      "sha256": "0743234014cd8fe61d840a52d3b4d39f942bb532a00f12527a8f27d3939b4090",
+      "bytes": 1168
+    },
+    "repo_payload/notebooks/MUTCD_updated_kg_github_benchmark.ipynb": {
+      "sha256": "76f09e4b9389b75c93c6abac7f0a6d97c8ff35b9437c2e29d6b991175f0f4c07",
+      "bytes": 3254421
+    },
+    "repo_payload/scripts/verify_mutcd_benchmark_assets.sh": {
+      "sha256": "030e41ce6846e6d5d916541c308947d7c3b23bc3ed677c667e79330d9c43b578",
+      "bytes": 1188
+    },
+    "verify_bundle.sh": {
+      "sha256": "a66a97126dacb43f645036318eb01d0f48bd8da9712994a81a8a23b5738fb03e",
+      "bytes": 554
+    }
+  },
+  "notes": "package_manifest.json is not self-hashed."
+}
