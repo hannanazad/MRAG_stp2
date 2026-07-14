@@ -79,9 +79,20 @@ class VLM:
         except ImportError:
             raise ImportError("API mode needs the openai package: pip install openai")
         self._api_clients = {}
-        # Build the client for the CURRENT model eagerly so a missing API key
-        # fails at load time with a friendly message, not mid-question.
-        self._client_for(CFG.vlm_model_api)
+        # v4.6: try to build the client for the CURRENT model so a missing key
+        # surfaces early — but only as a WARNING. Eagerly raising here blocked
+        # users who load keys for a different provider than the default model
+        # (e.g. Anthropic-only key with the default DashScope model). Clients
+        # are built lazily on first use, so init always succeeds and the model
+        # can be switched afterwards with CFG.set_vlm_model(...).
+        try:
+            self._client_for(CFG.vlm_model_api)
+        except EnvironmentError as e:
+            log.warning(
+                "No API key yet for the default model (%s). Pipeline will "
+                "initialise anyway; either load that key or switch models "
+                "with CFG.set_vlm_model(...) before asking. Detail: %s",
+                CFG.vlm_model_api, e)
         self._loaded_name = CFG.vlm_model_api
         log.info("VLM (api) ready: %s @ %s", CFG.vlm_model_api, CFG.api_base_url)
 
@@ -96,6 +107,10 @@ class VLM:
         if prov not in getattr(self, "_api_clients", {}):
             spec = VLM_PROVIDERS[prov]
             api_key = os.environ.get(spec["env_var"])
+            if not api_key and prov == "dashscope":
+                # legacy name used by pre-v4.4 notebooks (cell 0.5 set
+                # VLM_API_KEY); accept it so old setups keep working
+                api_key = os.environ.get("VLM_API_KEY")
             if not api_key:
                 raise EnvironmentError(
                     f"Model {model_id!r} is served by {prov!r}. Set the "
