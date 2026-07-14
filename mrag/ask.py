@@ -113,15 +113,24 @@ def ask(question: str, show_text: bool = False, show_scores: bool = False,
     text_only = router_dec.get("needs_figures") is False
 
     if p.vlm is not None:
+        p.vlm.last_api_debug = {}
+
         try:
             answer = p.vlm.answer(
-                question, result.chunks, result.figures,
+                question,
+                result.chunks,
+                result.figures,
                 [] if text_only else result.pages,
                 max_new_tokens=CFG.max_new_tokens,
             )
         except Exception as e:
             log.exception("VLM generation failed")
             answer = f"(VLM error: {e!r})"
+
+        if p.vlm.last_api_debug:
+            result.debug["vlm_response"] = dict(
+                p.vlm.last_api_debug
+            )
     else:
         answer = "(VLM not loaded — `init_pipeline(load_vlm=True)`)"
 

@@ -80,10 +80,10 @@ def _default_hf_home(env: str, base: Path) -> Path:
 # (text_only) will return 400 InvalidParameter when ask() sends images.
 # ────────────────────────────────────────────────────────────────────────────
 # ---------------------------------------------------------------------------
-# Multi-provider VLM support (v4.4). All three providers expose OpenAI-
-# compatible chat-completions endpoints, so one client code path serves all;
-# only base_url and the API-key env var differ. The provider is inferred from
-# the model id prefix — no per-entry tagging needed.
+# Multi-provider VLM support. DashScope and Gemini use their official
+# OpenAI-compatible endpoints. Claude is routed through Anthropic's native
+# Messages API by vlm.py so adaptive-thinking token budgets and content blocks
+# are handled reliably. The provider is inferred from the model-id prefix.
 # ---------------------------------------------------------------------------
 VLM_PROVIDERS = {
     "dashscope": {
@@ -288,8 +288,42 @@ class Config:
     rt_weight_support: float = 0.70
 
     # ----- Generation -------------------------------------------------------
+    # max_new_tokens remains the visible-answer/default budget for the
+    # existing DashScope runs. Provider-aware API ceilings below account for
+    # models whose hidden reasoning tokens share the same hard output cap.
     max_new_tokens: int = 480
     max_chunk_chars_in_prompt: int = 1400
+
+    # ----- Provider-aware API generation ------------------------------------
+    # Claude Sonnet 5 and Fable 5 use adaptive thinking. Anthropic documents
+    # max_tokens as a hard cap over thinking + visible response text, so the
+    # previous value of 480 could be consumed before a final answer appeared.
+    api_max_tokens_dashscope: int = 480
+    api_max_tokens_anthropic: int = 16000
+    api_max_tokens_gemini_frontier: int = 8192
+    api_max_tokens_gemini_balanced: int = 4096
+    api_max_tokens_gemini_fast: int = 2048
+
+    # One automatic retry is allowed when a provider explicitly reports
+    # length/max-token truncation. These are ceilings, not requested output
+    # lengths; concise responses normally stop well before them.
+    api_retry_on_truncation: bool = True
+    api_truncation_retry_multiplier: float = 2.0
+    api_max_tokens_ceiling_anthropic: int = 32000
+    api_max_tokens_ceiling_gemini: int = 16384
+    api_max_tokens_ceiling_dashscope: int = 2048
+
+    # Gemini OpenAI compatibility maps reasoning_effort to thinking_level.
+    gemini_reasoning_effort_frontier: str = "high"
+    gemini_reasoning_effort_balanced: str = "medium"
+    gemini_reasoning_effort_fast: str = "low"
+
+    # Inline image requests should remain below Google's documented total
+    # inline-request limit. This leaves headroom for prompt text and JSON.
+    api_max_inline_image_bytes: int = 18 * 1024 * 1024
+
+    # Metadata only: never stores hidden reasoning or raw API keys.
+    api_store_response_metadata: bool = True
 
     # ----- Prompt-style controls (stp2_v1) ----------------------------------
     # See module-level docstring above the dataclass for the catalogs.

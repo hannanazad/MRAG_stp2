@@ -39,6 +39,20 @@ from mrag.prompt_examples import FEWSHOT_EXAMPLES, format_example
 
 log = logging.getLogger("mrag.vlm")
 
+ADAPTER_VERSION = "1.0.0"
+
+
+class VLMResponseError(RuntimeError):
+    """Base class for provider responses that cannot be used as answers."""
+
+
+class VLMEmptyResponseError(VLMResponseError):
+    """Raised when a provider returns no extractable final answer text."""
+
+
+class VLMTruncatedResponseError(VLMResponseError):
+    """Raised when a provider stops because the output cap was reached."""
+
 
 class VLM:
     def __init__(
@@ -61,6 +75,9 @@ class VLM:
         self._processor = None
         self._loaded_name = None
         self._api_client = None
+        self._api_clients = {}
+        self._anthropic_clients = {}
+        self.last_api_debug: Dict[str, Any] = {}
 
     # ────────────────────────────────────────────────────────────────────
     # Loading
@@ -74,56 +91,123 @@ class VLM:
         return self
 
     def _load_api(self) -> None:
+        """Initialize provider clients lazily.
+
+        DashScope and Gemini use their official OpenAI-compatible endpoints.
+        Claude uses Anthropic's native Messages API because newer Claude
+        models use adaptive thinking and structured content blocks that are
+        more reliably represented by the native SDK.
+        """
         try:
             import openai  # noqa: F401
-        except ImportError:
-            raise ImportError("API mode needs the openai package: pip install openai")
+        except ImportError as exc:
+            raise ImportError(
+                "API mode needs the openai package: pip install openai"
+            ) from exc
+
         self._api_clients = {}
-        # v4.6: try to build the client for the CURRENT model so a missing key
-        # surfaces early — but only as a WARNING. Eagerly raising here blocked
-        # users who load keys for a different provider than the default model
-        # (e.g. Anthropic-only key with the default DashScope model). Clients
-        # are built lazily on first use, so init always succeeds and the model
-        # can be switched afterwards with CFG.set_vlm_model(...).
+        self._anthropic_clients = {}
+
         try:
-            self._client_for(CFG.vlm_model_api)
-        except EnvironmentError as e:
+            from .config import provider_of_model
+
+            provider = provider_of_model(CFG.vlm_model_api)
+
+            if provider == "anthropic":
+                self._anthropic_client_for(CFG.vlm_model_api)
+            else:
+                self._client_for(CFG.vlm_model_api)
+        except (EnvironmentError, ImportError) as exc:
             log.warning(
-                "No API key yet for the default model (%s). Pipeline will "
-                "initialise anyway; either load that key or switch models "
-                "with CFG.set_vlm_model(...) before asking. Detail: %s",
-                CFG.vlm_model_api, e)
+                "No usable API client yet for the default model (%s). "
+                "Pipeline initialization will continue; load the provider "
+                "key/dependency or switch models before asking. Detail: %s",
+                CFG.vlm_model_api,
+                exc,
+            )
+
         self._loaded_name = CFG.vlm_model_api
-        log.info("VLM (api) ready: %s @ %s", CFG.vlm_model_api, CFG.api_base_url)
+        log.info(
+            "VLM API adapter ready: %s @ %s",
+            CFG.vlm_model_api,
+            CFG.api_base_url,
+        )
 
     def _client_for(self, model_id: str):
-        """Return an OpenAI-compatible client for the provider that serves
-        `model_id` (v4.4 multi-provider). Clients are cached per provider, so
-        switching models — or running the P2 filter on DashScope while P1
-        answers on Anthropic/Gemini — needs no reload."""
+        """Return an OpenAI-compatible client for DashScope or Gemini."""
         import openai
         from .config import VLM_PROVIDERS, provider_of_model
-        prov = provider_of_model(model_id)
-        if prov not in getattr(self, "_api_clients", {}):
-            spec = VLM_PROVIDERS[prov]
-            api_key = os.environ.get(spec["env_var"])
-            if not api_key and prov == "dashscope":
-                # legacy name used by pre-v4.4 notebooks (cell 0.5 set
-                # VLM_API_KEY); accept it so old setups keep working
+
+        provider = provider_of_model(model_id)
+
+        if provider == "anthropic":
+            raise ValueError(
+                "Claude models use _anthropic_client_for(), not the "
+                "OpenAI-compatible client."
+            )
+
+        if provider not in self._api_clients:
+            specification = VLM_PROVIDERS[provider]
+            api_key = os.environ.get(specification["env_var"])
+
+            if not api_key and provider == "dashscope":
                 api_key = os.environ.get("VLM_API_KEY")
+
             if not api_key:
                 raise EnvironmentError(
-                    f"Model {model_id!r} is served by {prov!r}. Set the "
-                    f"environment variable '{spec['env_var']}' first, e.g.:\n"
-                    f"  import os; os.environ['{spec['env_var']}'] = '...'"
+                    f"Model {model_id!r} is served by {provider!r}. Set "
+                    f"'{specification['env_var']}' before calling it."
                 )
-            if not hasattr(self, "_api_clients"):
-                self._api_clients = {}
-            self._api_clients[prov] = openai.OpenAI(
-                api_key=api_key, base_url=spec["base_url"])
-            log.info("VLM client ready for provider %s @ %s",
-                     prov, spec["base_url"])
-        return self._api_clients[prov]
+
+            self._api_clients[provider] = openai.OpenAI(
+                api_key=api_key,
+                base_url=specification["base_url"],
+            )
+
+            log.info(
+                "OpenAI-compatible client ready for %s @ %s",
+                provider,
+                specification["base_url"],
+            )
+
+        return self._api_clients[provider]
+
+    def _anthropic_client_for(self, model_id: str):
+        """Return Anthropic's native client for Claude models."""
+        from .config import VLM_PROVIDERS, provider_of_model
+
+        provider = provider_of_model(model_id)
+
+        if provider != "anthropic":
+            raise ValueError(
+                f"Model {model_id!r} is not an Anthropic model."
+            )
+
+        if provider not in self._anthropic_clients:
+            try:
+                import anthropic
+            except ImportError as exc:
+                raise ImportError(
+                    "Claude native API support needs the anthropic package: "
+                    "pip install anthropic"
+                ) from exc
+
+            specification = VLM_PROVIDERS[provider]
+            api_key = os.environ.get(specification["env_var"])
+
+            if not api_key:
+                raise EnvironmentError(
+                    f"Set '{specification['env_var']}' before calling "
+                    f"{model_id!r}."
+                )
+
+            self._anthropic_clients[provider] = anthropic.Anthropic(
+                api_key=api_key
+            )
+
+            log.info("Native Anthropic client ready.")
+
+        return self._anthropic_clients[provider]
 
     def _load_local(self) -> None:
         import torch
@@ -204,23 +288,705 @@ class VLM:
 
     # ----- API generation (new) --------------------------------------------
 
-    def _answer_api(self, prompt: str, image_paths: List[str], max_new_tokens: int) -> str:
-        content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
-        for p in image_paths:
-            if Path(p).exists():
-                b64 = base64.b64encode(Path(p).read_bytes()).decode("utf-8")
-                content.append({
+    @staticmethod
+    def _safe_model_dump(value: Any) -> Dict[str, Any]:
+        if value is None:
+            return {}
+
+        if isinstance(value, dict):
+            return value
+
+        model_dump = getattr(value, "model_dump", None)
+        if callable(model_dump):
+            try:
+                dumped = model_dump()
+                return dumped if isinstance(dumped, dict) else {}
+            except Exception:
+                return {}
+
+        return {}
+
+    @classmethod
+    def _extract_text_content(cls, content: Any) -> str:
+        """Extract final text from string, dict, or typed content blocks.
+
+        This intentionally does not stringify unknown objects because an
+        object representation is not a model answer.
+        """
+        if content is None:
+            return ""
+
+        if isinstance(content, str):
+            return content.strip()
+
+        if isinstance(content, (list, tuple)):
+            parts = [
+                cls._extract_text_content(item)
+                for item in content
+            ]
+            return "\n".join(
+                part for part in parts if part
+            ).strip()
+
+        if isinstance(content, dict):
+            block_type = str(
+                content.get("type", "")
+            ).strip().lower()
+
+            if block_type in {"thinking", "reasoning", "redacted_thinking"}:
+                return ""
+
+            text_value = content.get("text")
+
+            if isinstance(text_value, str):
+                return text_value.strip()
+
+            if isinstance(text_value, dict):
+                nested_value = text_value.get("value")
+                if isinstance(nested_value, str):
+                    return nested_value.strip()
+
+            for key in ("content", "output_text", "value"):
+                if key in content:
+                    extracted = cls._extract_text_content(
+                        content[key]
+                    )
+                    if extracted:
+                        return extracted
+
+            return ""
+
+        block_type = str(
+            getattr(content, "type", "")
+        ).strip().lower()
+
+        if block_type in {"thinking", "reasoning", "redacted_thinking"}:
+            return ""
+
+        text_value = getattr(content, "text", None)
+
+        if isinstance(text_value, str):
+            return text_value.strip()
+
+        if text_value is not None:
+            extracted = cls._extract_text_content(text_value)
+            if extracted:
+                return extracted
+
+        nested_content = getattr(content, "content", None)
+        if nested_content is not None:
+            return cls._extract_text_content(nested_content)
+
+        dumped = cls._safe_model_dump(content)
+        if dumped:
+            return cls._extract_text_content(dumped)
+
+        return ""
+
+    @staticmethod
+    def _usage_dict(response: Any) -> Dict[str, Any]:
+        usage = getattr(response, "usage", None)
+
+        if usage is None:
+            return {}
+
+        if isinstance(usage, dict):
+            return usage
+
+        model_dump = getattr(usage, "model_dump", None)
+
+        if callable(model_dump):
+            try:
+                dumped = model_dump()
+                return dumped if isinstance(dumped, dict) else {}
+            except Exception:
+                return {}
+
+        result: Dict[str, Any] = {}
+
+        for field_name in (
+            "input_tokens",
+            "output_tokens",
+            "prompt_tokens",
+            "completion_tokens",
+            "total_tokens",
+        ):
+            field_value = getattr(usage, field_name, None)
+            if field_value is not None:
+                result[field_name] = field_value
+
+        return result
+
+    @staticmethod
+    def _content_block_types(content: Any) -> List[str]:
+        if not isinstance(content, (list, tuple)):
+            return [type(content).__name__]
+
+        types: List[str] = []
+
+        for block in content:
+            if isinstance(block, dict):
+                block_type = block.get("type")
+            else:
+                block_type = getattr(block, "type", None)
+
+            types.append(
+                str(block_type or type(block).__name__)
+            )
+
+        return types
+
+    @staticmethod
+    def _image_media_type(path: Path) -> str:
+        suffix = path.suffix.lower()
+
+        return {
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".webp": "image/webp",
+            ".gif": "image/gif",
+        }.get(suffix, "image/png")
+
+    def _provider_token_limit(
+        self,
+        model_id: str,
+        requested_tokens: int,
+    ) -> int:
+        from .config import provider_of_model
+
+        provider = provider_of_model(model_id)
+
+        if provider == "anthropic":
+            configured = int(
+                getattr(CFG, "api_max_tokens_anthropic", 16000)
+            )
+        elif provider == "gemini":
+            model_lower = model_id.lower()
+
+            if "pro" in model_lower:
+                configured = int(
+                    getattr(
+                        CFG,
+                        "api_max_tokens_gemini_frontier",
+                        8192,
+                    )
+                )
+            elif "flash-lite" in model_lower:
+                configured = int(
+                    getattr(
+                        CFG,
+                        "api_max_tokens_gemini_fast",
+                        2048,
+                    )
+                )
+            else:
+                configured = int(
+                    getattr(
+                        CFG,
+                        "api_max_tokens_gemini_balanced",
+                        4096,
+                    )
+                )
+        else:
+            configured = int(
+                getattr(
+                    CFG,
+                    "api_max_tokens_dashscope",
+                    requested_tokens,
+                )
+            )
+
+        return max(int(requested_tokens), configured)
+
+    def _provider_token_ceiling(self, model_id: str) -> int:
+        from .config import provider_of_model
+
+        provider = provider_of_model(model_id)
+
+        if provider == "anthropic":
+            return int(
+                getattr(
+                    CFG,
+                    "api_max_tokens_ceiling_anthropic",
+                    32000,
+                )
+            )
+
+        if provider == "gemini":
+            return int(
+                getattr(
+                    CFG,
+                    "api_max_tokens_ceiling_gemini",
+                    16384,
+                )
+            )
+
+        return int(
+            getattr(
+                CFG,
+                "api_max_tokens_ceiling_dashscope",
+                2048,
+            )
+        )
+
+    def _gemini_reasoning_effort(self, model_id: str) -> str:
+        model_lower = model_id.lower()
+
+        if "pro" in model_lower:
+            return str(
+                getattr(
+                    CFG,
+                    "gemini_reasoning_effort_frontier",
+                    "high",
+                )
+            )
+
+        if "flash-lite" in model_lower:
+            return str(
+                getattr(
+                    CFG,
+                    "gemini_reasoning_effort_fast",
+                    "low",
+                )
+            )
+
+        return str(
+            getattr(
+                CFG,
+                "gemini_reasoning_effort_balanced",
+                "medium",
+            )
+        )
+
+    def _openai_content(
+        self,
+        prompt: str,
+        image_paths: List[str],
+    ) -> List[Dict[str, Any]]:
+        content: List[Dict[str, Any]] = [
+            {"type": "text", "text": prompt}
+        ]
+
+        # Estimate the actual JSON payload contribution. Base64 expands raw
+        # image bytes by roughly 4/3, so comparing only raw bytes would exceed
+        # providers' inline-request limits.
+        estimated_request_bytes = len(prompt.encode("utf-8"))
+
+        for image_path in image_paths:
+            path = Path(image_path)
+
+            if not path.exists():
+                continue
+
+            raw = path.read_bytes()
+            estimated_request_bytes += 4 * ((len(raw) + 2) // 3)
+            encoded = base64.b64encode(raw).decode("utf-8")
+
+            content.append(
+                {
                     "type": "image_url",
-                    "image_url": {"url": f"data:image/png;base64,{b64}"},
-                })
+                    "image_url": {
+                        "url": (
+                            f"data:{self._image_media_type(path)};"
+                            f"base64,{encoded}"
+                        )
+                    },
+                }
+            )
+
+        maximum_inline_bytes = int(
+            getattr(
+                CFG,
+                "api_max_inline_image_bytes",
+                18 * 1024 * 1024,
+            )
+        )
+
+        if estimated_request_bytes > maximum_inline_bytes:
+            raise VLMResponseError(
+                "Estimated inline request payload is too large: "
+                f"{estimated_request_bytes:,} bytes exceed the configured "
+                f"{maximum_inline_bytes:,}-byte safety limit."
+            )
+
+        return content
+
+    def _anthropic_content(
+        self,
+        prompt: str,
+        image_paths: List[str],
+    ) -> List[Dict[str, Any]]:
+        content: List[Dict[str, Any]] = []
+
+        for image_path in image_paths:
+            path = Path(image_path)
+
+            if not path.exists():
+                continue
+
+            encoded = base64.b64encode(
+                path.read_bytes()
+            ).decode("utf-8")
+
+            content.append(
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": self._image_media_type(path),
+                        "data": encoded,
+                    },
+                }
+            )
+
+        content.append(
+            {"type": "text", "text": prompt}
+        )
+
+        return content
+
+    def _record_api_debug(
+        self,
+        *,
+        provider: str,
+        model_id: str,
+        response: Any,
+        raw_content: Any,
+        extracted_text: str,
+        token_limit: int,
+        image_count: int,
+        retry_number: int,
+        stop_reason: Any,
+    ) -> None:
+        if not getattr(CFG, "api_store_response_metadata", True):
+            self.last_api_debug = {}
+            return
+
+        self.last_api_debug = {
+            "provider": provider,
+            "model_id": model_id,
+            "response_id": getattr(response, "id", None),
+            "stop_reason": (
+                str(stop_reason)
+                if stop_reason is not None
+                else None
+            ),
+            "content_python_type": type(raw_content).__name__,
+            "content_block_types": self._content_block_types(
+                raw_content
+            ),
+            "extracted_answer_characters": len(extracted_text),
+            "requested_max_tokens": token_limit,
+            "image_count": image_count,
+            "adapter_retry_number": retry_number,
+            "usage": self._usage_dict(response),
+        }
+
+    def _parse_openai_response(
+        self,
+        response: Any,
+        *,
+        provider: str,
+        model_id: str,
+        token_limit: int,
+        image_count: int,
+        retry_number: int,
+    ) -> str:
+        choices = getattr(response, "choices", None) or []
+
+        if not choices:
+            raise VLMEmptyResponseError(
+                f"{provider} returned no completion choices."
+            )
+
+        choice = choices[0]
+        message = getattr(choice, "message", None)
+        raw_content = getattr(message, "content", None)
+        extracted_text = self._extract_text_content(raw_content)
+        finish_reason = getattr(choice, "finish_reason", None)
+
+        self._record_api_debug(
+            provider=provider,
+            model_id=model_id,
+            response=response,
+            raw_content=raw_content,
+            extracted_text=extracted_text,
+            token_limit=token_limit,
+            image_count=image_count,
+            retry_number=retry_number,
+            stop_reason=finish_reason,
+        )
+
+        normalized_finish_reason = str(
+            finish_reason or ""
+        ).strip().lower()
+
+        if normalized_finish_reason in {
+            "length",
+            "max_tokens",
+            "model_context_window_exceeded",
+        }:
+            raise VLMTruncatedResponseError(
+                f"{provider} stopped with finish_reason="
+                f"{finish_reason!r} at max_tokens={token_limit}."
+            )
+
+        if not extracted_text:
+            raise VLMEmptyResponseError(
+                f"{provider} returned an empty final answer "
+                f"(finish_reason={finish_reason!r}, "
+                f"content_type={type(raw_content).__name__})."
+            )
+
+        return extracted_text
+
+    def _parse_anthropic_response(
+        self,
+        response: Any,
+        *,
+        model_id: str,
+        token_limit: int,
+        image_count: int,
+        retry_number: int,
+    ) -> str:
+        raw_content = getattr(response, "content", None)
+        extracted_text = self._extract_text_content(raw_content)
+        stop_reason = getattr(response, "stop_reason", None)
+
+        self._record_api_debug(
+            provider="anthropic",
+            model_id=model_id,
+            response=response,
+            raw_content=raw_content,
+            extracted_text=extracted_text,
+            token_limit=token_limit,
+            image_count=image_count,
+            retry_number=retry_number,
+            stop_reason=stop_reason,
+        )
+
+        normalized_stop_reason = str(
+            stop_reason or ""
+        ).strip().lower()
+
+        if normalized_stop_reason in {
+            "max_tokens",
+            "model_context_window_exceeded",
+        }:
+            raise VLMTruncatedResponseError(
+                "Anthropic stopped because the output cap was reached "
+                f"at max_tokens={token_limit}."
+            )
+
+        if normalized_stop_reason == "refusal":
+            raise VLMResponseError(
+                "Anthropic returned a refusal stop reason."
+            )
+
+        if not extracted_text:
+            raise VLMEmptyResponseError(
+                "Anthropic returned no final text blocks "
+                f"(stop_reason={stop_reason!r})."
+            )
+
+        return extracted_text
+
+    def _answer_openai_compatible(
+        self,
+        *,
+        provider: str,
+        model_id: str,
+        prompt: str,
+        image_paths: List[str],
+        token_limit: int,
+    ) -> str:
+        content = self._openai_content(
+            prompt,
+            image_paths,
+        )
+
+        request_arguments: Dict[str, Any] = {
+            "model": model_id,
+            "messages": [
+                {"role": "user", "content": content}
+            ],
+            "max_tokens": token_limit,
+        }
+
+        if provider == "gemini":
+            request_arguments["reasoning_effort"] = (
+                self._gemini_reasoning_effort(model_id)
+            )
+
+        response = self._client_for(
+            model_id
+        ).chat.completions.create(
+            **request_arguments
+        )
+
+        return self._parse_openai_response(
+            response,
+            provider=provider,
+            model_id=model_id,
+            token_limit=token_limit,
+            image_count=len(image_paths),
+            retry_number=0,
+        )
+
+    def _answer_anthropic(
+        self,
+        *,
+        model_id: str,
+        prompt: str,
+        image_paths: List[str],
+        token_limit: int,
+        retry_number: int,
+    ) -> str:
+        response = self._anthropic_client_for(
+            model_id
+        ).messages.create(
+            model=model_id,
+            max_tokens=token_limit,
+            messages=[
+                {
+                    "role": "user",
+                    "content": self._anthropic_content(
+                        prompt,
+                        image_paths,
+                    ),
+                }
+            ],
+        )
+
+        return self._parse_anthropic_response(
+            response,
+            model_id=model_id,
+            token_limit=token_limit,
+            image_count=len(image_paths),
+            retry_number=retry_number,
+        )
+
+    def _answer_api(
+        self,
+        prompt: str,
+        image_paths: List[str],
+        max_new_tokens: int,
+    ) -> str:
+        from .config import provider_of_model
 
         model_id = CFG.vlm_model_api
-        response = self._client_for(model_id).chat.completions.create(
-            model=model_id,
-            messages=[{"role": "user", "content": content}],
-            max_tokens=max_new_tokens,
+        provider = provider_of_model(model_id)
+        token_limit = self._provider_token_limit(
+            model_id,
+            max_new_tokens,
         )
-        return response.choices[0].message.content.strip()
+        token_ceiling = self._provider_token_ceiling(
+            model_id
+        )
+
+        maximum_attempts = (
+            2
+            if getattr(
+                CFG,
+                "api_retry_on_truncation",
+                True,
+            )
+            else 1
+        )
+
+        last_error: Optional[Exception] = None
+
+        for retry_number in range(maximum_attempts):
+            try:
+                if provider == "anthropic":
+                    return self._answer_anthropic(
+                        model_id=model_id,
+                        prompt=prompt,
+                        image_paths=image_paths,
+                        token_limit=token_limit,
+                        retry_number=retry_number,
+                    )
+
+                content = self._openai_content(
+                    prompt,
+                    image_paths,
+                )
+
+                request_arguments: Dict[str, Any] = {
+                    "model": model_id,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": content,
+                        }
+                    ],
+                    "max_tokens": token_limit,
+                }
+
+                if provider == "gemini":
+                    request_arguments[
+                        "reasoning_effort"
+                    ] = self._gemini_reasoning_effort(
+                        model_id
+                    )
+
+                response = self._client_for(
+                    model_id
+                ).chat.completions.create(
+                    **request_arguments
+                )
+
+                return self._parse_openai_response(
+                    response,
+                    provider=provider,
+                    model_id=model_id,
+                    token_limit=token_limit,
+                    image_count=len(image_paths),
+                    retry_number=retry_number,
+                )
+
+            except VLMTruncatedResponseError as exc:
+                last_error = exc
+
+                if retry_number + 1 >= maximum_attempts:
+                    raise
+
+                larger_limit = min(
+                    token_ceiling,
+                    max(
+                        token_limit + 1,
+                        int(
+                            token_limit
+                            * float(
+                                getattr(
+                                    CFG,
+                                    "api_truncation_retry_multiplier",
+                                    2.0,
+                                )
+                            )
+                        ),
+                    ),
+                )
+
+                if larger_limit <= token_limit:
+                    raise
+
+                log.warning(
+                    "%s response was truncated at %d tokens; "
+                    "retrying once with %d.",
+                    provider,
+                    token_limit,
+                    larger_limit,
+                )
+
+                token_limit = larger_limit
+
+        if last_error is not None:
+            raise last_error
+
+        raise VLMEmptyResponseError(
+            f"{provider} did not return a usable answer."
+        )
 
     # ────────────────────────────────────────────────────────────────────
     # Figure relevance filter (v5+) — one extra cheap VLM call that scores
@@ -325,23 +1091,97 @@ class VLM:
                 pass
         return []
 
-    def _filter_figures_api(self, question, indexed_figures, max_keep):
-        prompt = self._filter_prompt(question, indexed_figures)
-        content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
-        for _i, ip, _f in indexed_figures:
-            b64 = base64.b64encode(Path(ip).read_bytes()).decode("utf-8")
-            content.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:image/png;base64,{b64}"},
-            })
-        filter_model = getattr(CFG, "vlm_model_filter", None) or CFG.vlm_model_api
-        response = self._client_for(filter_model).chat.completions.create(
-            model=filter_model,
-            messages=[{"role": "user", "content": content}],
-            max_tokens=80,  # short reply — just an index list
+    def _filter_figures_api(
+        self,
+        question,
+        indexed_figures,
+        max_keep,
+    ):
+        from .config import provider_of_model
+
+        prompt = self._filter_prompt(
+            question,
+            indexed_figures,
         )
+
+        filter_model = (
+            getattr(CFG, "vlm_model_filter", None)
+            or CFG.vlm_model_api
+        )
+
+        provider = provider_of_model(filter_model)
+        image_paths = [
+            image_path
+            for _index, image_path, _figure
+            in indexed_figures
+        ]
+
+        # Figure filtering is a short classification task. Use a modest but
+        # thinking-safe cap for Claude/Gemini, and low reasoning for Gemini.
+        if provider == "anthropic":
+            response = self._anthropic_client_for(
+                filter_model
+            ).messages.create(
+                model=filter_model,
+                max_tokens=2048,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": self._anthropic_content(
+                            prompt,
+                            image_paths,
+                        ),
+                    }
+                ],
+            )
+            response_text = self._parse_anthropic_response(
+                response,
+                model_id=filter_model,
+                token_limit=2048,
+                image_count=len(image_paths),
+                retry_number=0,
+            )
+        else:
+            request_arguments: Dict[str, Any] = {
+                "model": filter_model,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": self._openai_content(
+                            prompt,
+                            image_paths,
+                        ),
+                    }
+                ],
+                "max_tokens": (
+                    512
+                    if provider == "gemini"
+                    else 80
+                ),
+            }
+
+            if provider == "gemini":
+                request_arguments["reasoning_effort"] = "low"
+
+            response = self._client_for(
+                filter_model
+            ).chat.completions.create(
+                **request_arguments
+            )
+
+            response_text = self._parse_openai_response(
+                response,
+                provider=provider,
+                model_id=filter_model,
+                token_limit=request_arguments[
+                    "max_tokens"
+                ],
+                image_count=len(image_paths),
+                retry_number=0,
+            )
+
         return self._parse_filter_response(
-            response.choices[0].message.content or ""
+            response_text
         )
 
     def _filter_figures_local(self, question, indexed_figures, max_keep):
