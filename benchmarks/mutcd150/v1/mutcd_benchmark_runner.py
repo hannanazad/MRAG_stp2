@@ -39,7 +39,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, MutableMapping, Optional, Sequence
 
-RUNNER_VERSION = "1.1.0"
+RUNNER_VERSION = "1.1.1"
 RUN_SCHEMA_VERSION = "1.1"
 EXPECTED_BENCHMARK_VERSION = "MUTCD-150-v1.0"
 EXPECTED_QUESTION_COUNT = 150
@@ -624,9 +624,29 @@ def extract_answer(captured: CapturedCall) -> tuple[str, str]:
     if match and match.group(1).strip():
         return match.group(1).strip(), "stdout_answer_section"
 
+    # Never treat notebook section headings or retrieval/debug displays as
+    # model answers.  Some providers can return an empty answer while the
+    # notebook still renders headings such as "### Figures the model saw".
+    # Returning those headings as answers causes silent false-success records.
+    structural_heading = re.compile(
+        r"(?is)^\s*#{1,6}\s*(?:"
+        r"q|question|answer|figures?(?:\s+the\s+model\s+saw)?|"
+        r"pages?(?:\s+retrieved.*)?|retrieved(?:\s+chunks)?|"
+        r"debug|context|evidence|sources?|citations?"
+        r")\s*:?[\s\n]*$"
+    )
+
     for md in markdowns:
         stripped = md.strip()
-        if stripped and not stripped.lower().startswith("### q"):
+        if not stripped:
+            continue
+        if structural_heading.fullmatch(stripped):
+            continue
+        if stripped.lower().startswith("### q"):
+            continue
+        # A substantive fallback should contain more than a bare heading or
+        # label.  This remains permissive for short factual answers.
+        if len(re.sub(r"\s+", " ", stripped)) >= 8:
             return stripped, "display_markdown_fallback"
 
     return "", "not_found"
