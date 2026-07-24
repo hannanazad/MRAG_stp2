@@ -1,6 +1,3 @@
-# A1: Question router OFF.
-# All queries route through figure retrieval regardless of textual/definitional signal.
-# Expected direction: precision drops on text-only queries; recall unchanged on visual queries.
 ablation_id: A1_no_router
 vlm_alias: fable
 prompt_style: fewshot

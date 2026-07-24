@@ -5,11 +5,13 @@ Applies leave-one-out ablations by mutating CFG values and/or swapping pipeline
 components with no-ops. Does NOT modify the mrag/ package. Each call is
 reversible via the returned undo() callable.
 
+No GPT calls, no external network dependency.
+
 Usage:
     from ablations.ablation_shims import apply_ablation
     undo = apply_ablation(pipeline, "A1_no_router")
     try:
-        result = ask("...")
+        result = ask(question)
     finally:
         undo()
 """
@@ -18,7 +20,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List
 
 log = logging.getLogger(__name__)
 
@@ -47,7 +49,6 @@ class NoOpReranker:
     def compute_score(self, pairs, **kwargs) -> List[float]:
         return [1.0 - i * 1e-6 for i in range(len(pairs))]
 
-    # Fallback: catch any other method call and log a warning so misses are visible.
     def __getattr__(self, name):
         def _stub(*args, **kwargs):
             log.warning(
@@ -74,37 +75,37 @@ class Ablation:
 ABLATIONS: Dict[str, Ablation] = {
     "baseline": Ablation(
         id="baseline",
-        description="No changes — production defaults. Used only as a control run; "
-                    "the true baseline is your existing 88.08 scored.jsonl.",
+        description="Production defaults. Optional control run; the actual baseline "
+                    "is your existing MUTCD-150 scored file.",
     ),
     "A1_no_router": Ablation(
         id="A1_no_router",
-        description="Disable question router (always attempt figure retrieval).",
+        description="Disable question router.",
         cfg_patches={"use_question_router": False},
     ),
     "A2_no_vlm_filter": Ablation(
         id="A2_no_vlm_filter",
-        description="Disable VLM figure filter (keep top-k candidates as-is).",
+        description="Disable VLM figure filter.",
         cfg_patches={"use_vlm_figure_filter": False},
     ),
     "A3_no_graph": Ablation(
         id="A3_no_graph",
-        description="Zero out graph proximity contribution to fused score.",
+        description="Zero graph proximity contribution.",
         cfg_patches={"w_graph": 0.0},
     ),
     "A4_no_rule_type": Ablation(
         id="A4_no_rule_type",
-        description="Zero out rule-type weight contribution.",
+        description="Zero rule-type weight contribution.",
         cfg_patches={"w_ruletype": 0.0},
     ),
     "A5_no_hierarchy": Ablation(
         id="A5_no_hierarchy",
-        description="Zero out hierarchy prior contribution.",
+        description="Zero hierarchy prior contribution.",
         cfg_patches={"w_hierarchy": 0.0},
     ),
     "A6_no_reranker": Ablation(
         id="A6_no_reranker",
-        description="Swap the cross-encoder reranker for a NoOp passthrough.",
+        description="Swap cross-encoder reranker for NoOp passthrough.",
         swap_reranker=True,
     ),
 }
@@ -123,10 +124,7 @@ def _get_cfg():
 def apply_ablation(pipeline, ablation_id: str) -> Callable[[], None]:
     """
     Apply the named ablation to CFG and, if applicable, the pipeline object.
-
     Returns an `undo()` callable that restores the exact prior state.
-
-    Raises KeyError if ablation_id is unknown.
     """
     if ablation_id not in ABLATIONS:
         raise KeyError(
@@ -136,26 +134,23 @@ def apply_ablation(pipeline, ablation_id: str) -> Callable[[], None]:
     ablation = ABLATIONS[ablation_id]
     cfg = _get_cfg()
 
-    # Snapshot CFG values we're about to change.
     cfg_snapshot: Dict[str, Any] = {}
     for key, new_value in ablation.cfg_patches.items():
         if not hasattr(cfg, key):
             log.warning(
                 "CFG has no attribute %r — ablation %s may not affect the pipeline. "
-                "Check config.py for the correct name.",
+                "Verify config.py for the correct name.",
                 key, ablation_id,
             )
         cfg_snapshot[key] = getattr(cfg, key, None)
         setattr(cfg, key, new_value)
         log.info("[%s] CFG.%s: %r → %r", ablation_id, key, cfg_snapshot[key], new_value)
 
-    # Snapshot + swap reranker if requested.
     reranker_snapshot = None
     if ablation.swap_reranker:
         if not hasattr(pipeline, "reranker"):
             log.error(
-                "[%s] pipeline has no `reranker` attribute — cannot apply A6. "
-                "Inspect pipeline object; may need attribute-name adjustment.",
+                "[%s] pipeline has no `reranker` attribute — cannot apply A6.",
                 ablation_id,
             )
         else:
@@ -174,22 +169,11 @@ def apply_ablation(pipeline, ablation_id: str) -> Callable[[], None]:
 
 
 def list_ablations() -> List[Dict[str, str]]:
-    """Return a human-readable list of registered ablations for the notebook."""
-    return [
-        {"id": a.id, "description": a.description}
-        for a in ABLATIONS.values()
-    ]
+    return [{"id": a.id, "description": a.description} for a in ABLATIONS.values()]
 
-
-# ---------------------------------------------------------------------------
-# Verification helper
-# ---------------------------------------------------------------------------
 
 def verify_ablation_applied(ablation_id: str, pipeline) -> Dict[str, Any]:
-    """
-    Sanity check that the ablation is actually in effect. Returns a dict of
-    checks + observed values. Call AFTER apply_ablation, BEFORE the sweep.
-    """
+    """Sanity-check the ablation is actually in effect."""
     ablation = ABLATIONS[ablation_id]
     cfg = _get_cfg()
     checks: Dict[str, Any] = {}

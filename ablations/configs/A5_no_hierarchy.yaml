@@ -1,6 +1,3 @@
-# A5: Hierarchy prior zeroed.
-# Chapter/section hierarchy prior on retrieval candidates removed.
-# Expected direction: completeness drops on multi-section provisions.
 ablation_id: A5_no_hierarchy
 vlm_alias: fable
 prompt_style: fewshot

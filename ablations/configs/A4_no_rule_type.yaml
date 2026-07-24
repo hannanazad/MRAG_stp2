@@ -1,6 +1,3 @@
-# A4: Rule-type weight zeroed.
-# The Standard/Guidance/Option boosting term removed from fused score.
-# Expected direction: category_correctness drops; verbatim_faithfulness marginal.
 ablation_id: A4_no_rule_type
 vlm_alias: fable
 prompt_style: fewshot

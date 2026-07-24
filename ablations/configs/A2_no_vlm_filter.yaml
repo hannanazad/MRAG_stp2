@@ -1,6 +1,3 @@
-# A2: VLM figure filter OFF.
-# All top-K figure candidates pass through to the answer VLM without VLM-based pruning.
-# Expected direction: figure_precision drops; figure_relevance drops.
 ablation_id: A2_no_vlm_filter
 vlm_alias: fable
 prompt_style: fewshot
