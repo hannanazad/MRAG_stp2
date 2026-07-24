@@ -1,0 +1,7 @@
+# Ignore all per-run artifacts (they're large and reproducible).
+# Keep summary.csv, delta_plot.png, and this .gitignore committed.
+*
+!.gitignore
+!summary.csv
+!delta_plot.png
+!per_item_deltas.jsonl

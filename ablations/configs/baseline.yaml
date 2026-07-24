@@ -1,0 +1,9 @@
+# Baseline (control) — production defaults.
+# NOTE: the TRUE baseline for comparison is your existing MUTCD-150 Fable-5
+# fewshot scored.jsonl (total_over_97 = 88.08). This config is only used if you
+# want to run baseline again for reproducibility verification.
+ablation_id: baseline
+vlm_alias: fable
+prompt_style: fewshot
+gold_path: /content/drive/MyDrive/MRAG/eval/gold_qa.jsonl
+output_path: ablations/results/runs_baseline.jsonl

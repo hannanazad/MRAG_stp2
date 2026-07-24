@@ -1,0 +1,8 @@
+# A6: Cross-encoder reranker OFF (runtime swap for NoOpReranker).
+# Retrieval candidates pass through in dense-score order without cross-encoder rescoring.
+# Expected direction: context_precision drops; figure_grounding drops.
+ablation_id: A6_no_reranker
+vlm_alias: fable
+prompt_style: fewshot
+gold_path: /content/drive/MyDrive/MRAG/eval/gold_qa.jsonl
+output_path: ablations/results/runs_A6_no_reranker.jsonl

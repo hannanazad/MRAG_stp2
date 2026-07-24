@@ -1,0 +1,8 @@
+# A5: Hierarchy prior zeroed.
+# Chapter/section hierarchy prior on retrieval candidates removed.
+# Expected direction: completeness drops on multi-section provisions.
+ablation_id: A5_no_hierarchy
+vlm_alias: fable
+prompt_style: fewshot
+gold_path: /content/drive/MyDrive/MRAG/eval/gold_qa.jsonl
+output_path: ablations/results/runs_A5_no_hierarchy.jsonl

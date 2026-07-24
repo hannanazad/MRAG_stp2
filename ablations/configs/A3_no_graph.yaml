@@ -1,0 +1,9 @@
+# A3: Graph proximity contribution zeroed.
+# KG-neighbor boosting on retrieval candidates removed; retrieval falls back to
+# dense + sparse fusion + rule-type + hierarchy only.
+# Expected direction: recall drops on cross-referenced provisions.
+ablation_id: A3_no_graph
+vlm_alias: fable
+prompt_style: fewshot
+gold_path: /content/drive/MyDrive/MRAG/eval/gold_qa.jsonl
+output_path: ablations/results/runs_A3_no_graph.jsonl

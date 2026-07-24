@@ -1,0 +1,8 @@
+# A4: Rule-type weight zeroed.
+# The Standard/Guidance/Option boosting term removed from fused score.
+# Expected direction: category_correctness drops; verbatim_faithfulness marginal.
+ablation_id: A4_no_rule_type
+vlm_alias: fable
+prompt_style: fewshot
+gold_path: /content/drive/MyDrive/MRAG/eval/gold_qa.jsonl
+output_path: ablations/results/runs_A4_no_rule_type.jsonl

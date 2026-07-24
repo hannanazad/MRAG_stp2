@@ -1,0 +1,8 @@
+# A2: VLM figure filter OFF.
+# All top-K figure candidates pass through to the answer VLM without VLM-based pruning.
+# Expected direction: figure_precision drops; figure_relevance drops.
+ablation_id: A2_no_vlm_filter
+vlm_alias: fable
+prompt_style: fewshot
+gold_path: /content/drive/MyDrive/MRAG/eval/gold_qa.jsonl
+output_path: ablations/results/runs_A2_no_vlm_filter.jsonl
